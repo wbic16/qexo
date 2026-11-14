@@ -16,9 +16,11 @@ pub enum Command {
     /// parse / explode / implode / seal / unseal / select / get,
     /// with their raw argument tails.
     FileOp(Vec<String>),
-    Config { auto_update: bool, evolve: bool },
+    Config { auto_update: bool, evolve: bool, release_signer: Option<String> },
     Doctor { fix: bool },
-    List,
+    List { json: bool },
+    Learn { status: bool },
+    Inventory { name: Option<String>, install: Option<String> },
     Register(Vec<String>),
     Release,
     Update { check: bool },
@@ -43,12 +45,43 @@ pub fn parse(args: &[String]) -> Command {
         "parse" | "explode" | "implode" | "seal" | "unseal" | "select" | "get" => {
             Command::FileOp(args.to_vec())
         }
-        "config" => Command::Config {
-            auto_update: args.iter().any(|a| a == "--auto-update"),
-            evolve: args.iter().any(|a| a == "--evolve"),
-        },
+        "config" => {
+            let mut release_signer: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--release-signer" && i + 1 < args.len() {
+                    release_signer = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Command::Config {
+                auto_update: args.iter().any(|a| a == "--auto-update"),
+                evolve: args.iter().any(|a| a == "--evolve"),
+                release_signer,
+            }
+        }
         "doctor" => Command::Doctor { fix: args.iter().any(|a| a == "--fix") },
-        "list" => Command::List,
+        "list" => Command::List { json: args.iter().any(|a| a == "--json") },
+        "learn" => Command::Learn { status: args.iter().any(|a| a == "--status") },
+        "inventory" | "catalog" => {
+            let mut name: Option<String> = None;
+            let mut install: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--install" && i + 1 < args.len() {
+                    install = Some(args[i + 1].clone());
+                    i += 2;
+                } else if !args[i].starts_with("--") && name.is_none() {
+                    name = Some(args[i].clone());
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            Command::Inventory { name, install }
+        }
         "register" => Command::Register(args[1..].to_vec()),
         "release" => Command::Release,
         "update" => Command::Update { check: args.iter().any(|a| a == "--check") },
@@ -84,25 +117,48 @@ pub fn parse(args: &[String]) -> Command {
 
 pub fn help_text() -> String {
     let mut s = String::new();
-    s.push_str("qexo v1.3.0 — the Exocortex coordinator (phext-native)\n");
-    s.push_str("All node state lives in one file: /var/lib/qexo/state.phext\n");
-    s.push_str("(QEXO_STATE overrides the path for development and tests.)\n\n");
+    s.push_str("qexo v1.4.0 — the Exocortex coordinator (phext-native)\n");
+    s.push_str("All node state lives in one phext file, found by resolution:\n");
+    s.push_str("QEXO_STATE when set; else the system state /var/lib/qexo/state.phext when it\n");
+    s.push_str("exists and is readable; else the per-user state ~/.qexo/state.phext (Windows:\n");
+    s.push_str("under the user profile). A fresh `qexo config` as a normal user births a\n");
+    s.push_str("per-user node — no sudo anywhere in its life. `qexo status` names the live path.\n\n");
 
     s.push_str("Everyday:\n");
     s.push_str("  qexo                      the current plan, human rendering\n");
     s.push_str("  qexo plan                 the same, explicitly\n");
     s.push_str("  qexo status               node, version, state path, key, peers, hosted, doctor headline\n");
     s.push_str("  qexo doctor [--fix]       health report; --fix repairs what is safely repairable\n");
+    s.push_str("  qexo learn                Learn You a qexo! — the wizard: chapter map, lessons, due cards\n");
+    s.push_str("                            as practice. keys: space reveal, 1/2/3 grade (again/good/easy),\n");
+    s.push_str("                            b chapter map, d due queue, q quit (progress saves per card)\n");
+    s.push_str("  qexo learn --status       deck size, due count, mastered count — no session\n");
     s.push_str("  qexo --help               this text\n\n");
 
+    s.push_str("The ecosystem:\n");
+    s.push_str("  qexo inventory            the phext ecosystem roster (alias: catalog): every shipped product,\n");
+    s.push_str("                            what it is, where it lives, how to install and launch it\n");
+    s.push_str("  qexo inventory <name>     one product's full record\n");
+    s.push_str("  qexo inventory --install <name>\n");
+    s.push_str("                            print the product's install command, ready to copy — print-only:\n");
+    s.push_str("                            qexo never installs ecosystem products silently\n\n");
+
     s.push_str("Identity & peers:\n");
-    s.push_str("  qexo config               birth the node: create state.phext, set up the node GPG key\n");
+    s.push_str("  qexo config               birth the node: create the state phext (the system path when\n");
+    s.push_str("                            privileged, the per-user path otherwise), set up the node key\n");
     s.push_str("  qexo config --auto-update turn automatic updates on (config record) and install the systemd timer where possible\n");
     s.push_str("  qexo config --evolve      set evolve: on — the automatic timer's trigger becomes a full evolve pass\n");
+    s.push_str("  qexo config --release-signer <FP>\n                            set the trusted release signer fingerprint in the config record\n");
     s.push_str("                            instead of update alone (update is one stage of evolve; see below)\n");
-    s.push_str("  qexo list                 the registered peers\n");
+    s.push_str("  qexo list                 the phextnet as a navigation tree: this node and its peers nested\n");
+    s.push_str("                            under the peers anchor 3.3.3/3.3.3/3.3.3, named by hostname\n");
+    s.push_str("  qexo list --json          the flat machine shape (JSON is the interop gasket, unchanged)\n");
     s.push_str("  qexo register <pubkey> [--endpoint <url>]   register a peer's public key (armored text, a file path, or - for stdin);\n");
-    s.push_str("                            the endpoint (its qexo serve base URL) is recorded on the peer so update can poll it\n\n");
+    s.push_str("                            the endpoint (its qexo serve base URL) is recorded on the peer so update can poll it.\n");
+    s.push_str("                            the peer's host name is read from its key's user id and recorded as host: —\n");
+    s.push_str("                            displays name machines, never bare addresses, where a name exists.\n");
+    s.push_str("                            fleet convention: a peer's name IS its tailnet hostname; register it by a\n");
+    s.push_str("                            hostname endpoint (http://<hostname>:8484) so the net reads by name end to end\n\n");
 
     s.push_str("Updates — over the phextnet:\n");
     s.push_str("  qexo release              announce this node's binary as a signed release (manifest scroll in the ledgers;\n");
@@ -147,8 +203,9 @@ pub fn help_text() -> String {
     s.push_str("  qexo implode <file>       parse + re-serialize (canonical form check)\n");
     s.push_str("  qexo seal <file>          write <file>.xz (stored-form seal)\n");
     s.push_str("  qexo unseal <file.xz>     print the unsealed text\n");
-    s.push_str("  qexo select <file> <coord>   print one scroll\n");
-    s.push_str("  qexo get <file> <coord>      same as select\n");
+    s.push_str("  qexo select <file> <coord>   print one scroll from a phext file\n");
+    s.push_str("  qexo select <coord>          print one scroll from this node's state\n");
+    s.push_str("  qexo get ...                 same as select, both forms\n");
     s
 }
 
@@ -166,9 +223,10 @@ mod tests {
         assert_eq!(parse(&v(&["--help"])), Command::Help);
         assert_eq!(parse(&v(&["-h"])), Command::Help);
         assert_eq!(parse(&v(&["help"])), Command::Help);
-        assert_eq!(parse(&v(&["config"])), Command::Config { auto_update: false, evolve: false });
-        assert_eq!(parse(&v(&["config", "--auto-update"])), Command::Config { auto_update: true, evolve: false });
-        assert_eq!(parse(&v(&["config", "--evolve"])), Command::Config { auto_update: false, evolve: true });
+        assert_eq!(parse(&v(&["config"])), Command::Config { auto_update: false, evolve: false, release_signer: None });
+        assert_eq!(parse(&v(&["config", "--auto-update"])), Command::Config { auto_update: true, evolve: false, release_signer: None });
+        assert_eq!(parse(&v(&["config", "--evolve"])), Command::Config { auto_update: false, evolve: true, release_signer: None });
+        assert_eq!(parse(&v(&["config", "--release-signer", "A4E7277FB3EB0E589604BE5B506DBE3FC209E755"])), Command::Config { auto_update: false, evolve: false, release_signer: Some("A4E7277FB3EB0E589604BE5B506DBE3FC209E755".to_string()) });
         assert_eq!(parse(&v(&["release"])), Command::Release);
         assert_eq!(parse(&v(&["update"])), Command::Update { check: false });
         assert_eq!(parse(&v(&["update", "--check"])), Command::Update { check: true });
@@ -176,7 +234,14 @@ mod tests {
         assert_eq!(parse(&v(&["evolve", "--check"])), Command::Evolve { check: true });
         assert_eq!(parse(&v(&["doctor"])), Command::Doctor { fix: false });
         assert_eq!(parse(&v(&["doctor", "--fix"])), Command::Doctor { fix: true });
-        assert_eq!(parse(&v(&["list"])), Command::List);
+        assert_eq!(parse(&v(&["list"])), Command::List { json: false });
+        assert_eq!(parse(&v(&["list", "--json"])), Command::List { json: true });
+        assert_eq!(parse(&v(&["learn"])), Command::Learn { status: false });
+        assert_eq!(parse(&v(&["learn", "--status"])), Command::Learn { status: true });
+        assert_eq!(parse(&v(&["inventory"])), Command::Inventory { name: None, install: None });
+        assert_eq!(parse(&v(&["catalog"])), Command::Inventory { name: None, install: None });
+        assert_eq!(parse(&v(&["inventory", "sq"])), Command::Inventory { name: Some("sq".into()), install: None });
+        assert_eq!(parse(&v(&["inventory", "--install", "sq"])), Command::Inventory { name: None, install: Some("sq".into()) });
         assert_eq!(parse(&v(&["register", "keyfile.asc"])), Command::Register(v(&["keyfile.asc"])));
         assert_eq!(parse(&v(&["host"])), Command::Host { persona: None, boot: None });
         assert_eq!(
@@ -203,7 +268,7 @@ mod tests {
         for word in [
             "config", "doctor", "list", "register", "release", "update", "evolve", "host", "unhost", "message", "status",
             "plan", "serve", "wiring-check", "parse", "explode", "implode", "seal", "unseal",
-            "select", "get", "--help", "/var/lib/qexo/state.phext",
+            "select", "get", "--help", "/var/lib/qexo/state.phext", "learn", "inventory", "~/.qexo/state.phext",
         ] {
             assert!(h.contains(word), "help is missing {}", word);
         }

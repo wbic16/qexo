@@ -1,3 +1,41 @@
+# qexo v1.6.0 — ship notes (the Android repo comes current; home: wbic16/qexo)
+
+Status: v1.6.0 BUILT AND GATED, 2026-11-14 — this repo's tree
+is synced to wbic16/quarterexo v1.6.0 (PR #22 there) in one
+catch-up: the libphext-rs parser (v1.3.0), per-user installs,
+the nav-tree `list`, hostnames, `qexo learn` + inventory
+(v1.4.0), the state top-up and post-check repair distinction
+(v1.4.1/v1.4.2), the Learn You a qexo! wizard (v1.5.0), and
+internal OpenPGP (v1.6.0) — no `gpg` subprocess anywhere,
+which is what a node inside the Android app requires. The
+two-repo sync rule (Will, 2026-11-14) is the standing frame:
+one product, two homes, shared changes land in both.
+
+The port's original deltas, and where they live now:
+
+- The Android state-path fallback was generalized by the
+  main line in v1.4.0 (per-user state resolution) and is
+  preserved in that form: on Android the system path does
+  not exist and the process is unprivileged, so resolution
+  lands on $HOME/.qexo/state.phext, and the birth note
+  prints in its generalized wording.
+- The Android timer report is still Android-specific and
+  is carried verbatim: cfg(target_os = "android"), the
+  installer names the no-systemd truth and the manual
+  `qexo evolve` from Termux.
+- Internal OpenPGP (v1.6.0) removes the port's last runtime
+  dependency on Termux's gnupg package.
+
+APK packaging: the Termux binary route below stands. The
+standalone APK line is separate work — and per the
+apk-publishing guideline (Will, 2026-11-14) the app icons
+are still owed for both qexo's and Newt's APKs; none are
+fabricated here. No Android runtime exists on the ranch —
+phone execution is the operator's report, as before. See
+CHANGELOG 1.6.0 and the v1.3.0 port notes below.
+
+---
+
 # qexo v1.3.0 — ship notes (the Android port; home: wbic16/qexo)
 
 Status: v1.3.0 BUILT AND GATED, 2026-11-13 — qexo as a full
@@ -15,6 +53,144 @@ real Android LINK producing an ARM aarch64 binary. No Android
 runtime exists on the ranch — phone execution is the
 operator's report, as Windows execution was for v1.0.4. See
 CHANGELOG 1.3.0.
+
+---
+
+# qexo v1.6.0 (scratch line) — ship notes
+
+Status: v1.6.0 — OpenPGP moves inside. The `gpg` subprocess
+is gone: key generation, detached sign/verify, armored
+export, fingerprint and user-id reads all run in-process
+on the `pgp` crate (rpgp), per DESIGN §8.7's standing rule
+(never hand-roll OpenPGP) with the delegate changed — the
+same move as v1.3.0's libphext swap. A node now needs no
+gpg anywhere on the machine, which is what an in-app
+Android node requires. GnuPG-era keyrings migrate on first
+use: format-only conversion, originals untouched,
+fingerprint (node identity) unchanged — the whole fleet's
+keyrings, the release signer's included, keep working as
+they are. Interop with GnuPG is gated in both directions
+(internal signatures verify under system gpg; GnuPG
+signatures verify here; keys import across with
+fingerprints intact; a full config/register/sign/verify/
+update pass runs with gpg absent from PATH). See
+CHANGELOG 1.6.0 and src/crypto.rs's module note.
+
+---
+
+# qexo v1.5.0 (scratch line) — ship notes
+
+Status: v1.5.0 — the Learn You a qexo! wizard: `qexo learn`
+on a terminal opens a chapter map with a lesson screen per
+chapter and due cards as practice; the SM-2-lite engine,
+the 22-card deck and the state records are unchanged.
+Progress header on every screen; single-key flow (space /
+1-2-3 / b / d / q); every line wrapped to terminal width,
+40 columns by default (phone-first); Unix cbreak via
+std-only termios, line mode where raw mode is unavailable;
+piped stdin keeps the status view. See CHANGELOG 1.5.0.
+
+---
+
+# qexo v1.4.2 (scratch line) — ship notes
+
+Status: v1.4.2 — one refinement on v1.4.1, caught by
+v1.4.1's own consumer proof: `qexo learn --status` with no
+per-user state yet errored "not born" on machines with a
+readable system state, where v1.4.0 answered. Now learn
+prefers an EXISTING per-user deck and otherwise falls
+through to the shipped order. Sessions stay
+write-intending. Everything else is v1.4.1, unchanged.
+See CHANGELOG 1.4.2.
+
+---
+
+# qexo v1.4.1 (scratch line) — ship notes
+
+Status: v1.4.1 — the upgrade-path hotfix. v1.4.0's update
+post-check rolled back every state born under 1.3.0 (its
+doctor flags the missing lessons index, fixable, in check
+mode; the rollback removed the only binary that could fix
+it). v1.4.1: (1) homeland indexes top up on every state save,
+idempotently, on write paths only; (2) the post-check runs
+the new binary's `doctor --fix` and re-checks — fixable gaps
+become named repairs on the receipt, hard failures still
+roll back. The regression gate that was missing is standing:
+a real 1.3.0-born state fixture rides a signed two-node
+update end-to-end. Plus three field fixes: `list` URLs in
+the form that actually connects (fully-qualified tailnet
+names; the node's own serve URL on its self line; register
+records the DNS form), fingerprints printed in full
+everywhere, and intent-aware state resolution so `qexo
+learn` works as a standard user on a machine with a
+root-owned system state. See CHANGELOG 1.4.1.
+
+---
+
+# qexo v1.4.0 (scratch line) — ship notes
+
+Status: v1.4.0 BUILT AND GATED, 2026-11-14 — the install
+model release. State resolution generalizes the Android
+home fallback to every platform (QEXO_STATE, then the
+readable system state, then the per-user state ~/.qexo;
+per-user births need no sudo, proven in a mount namespace
+against an unreadable system state). `qexo list` renders
+the phextnet as a navigation tree; peers carry a host:
+field read from their key's user id, and displays name
+machines instead of surfacing bare IPs. Two new verbs:
+`qexo learn` (a 22-card spaced-repetition deck in the new
+10.10.10 homeland) and `qexo inventory` (the ecosystem
+roster from a 201-repo census — 11 verified products baked,
+each with its evidence). Gates: 71/71 unit tests, 42/42 CLI
+battery, interop against the published crates.io qexo
+1.3.0, conformance census identical to v1.3.0 (15/830/2),
+windows-gnu and aarch64-android links green. The parser
+layer is untouched. See CHANGELOG 1.4.0.
+
+---
+
+# qexo v1.3.0 (scratch line) — ship notes
+
+Status: v1.3.0 BUILT AND GATED, 2026-11-13 — the parser is
+libphext-rs now (crate pinned 0.6.0 from the crates.io
+registry — the chains release; first gated on 0.5.0 and
+re-gated end to end on 0.6.0 before merge); src/phext.rs
+is an adapter, the hand-rolled reckoning is deleted. The
+one-byte divergence it carried (library break \x02 vs the
+reference \x01) is diagnosed in the CHANGELOG with
+measurements from SQ 0.6.0 and libphext 0.5.0/0.6.0, and
+pinned by two regression tests, one of them tonight's file
+shape byte-for-byte. Siblings: `config
+--release-signer` (the signer as a command, not a hand
+edit) and the `select <coord>` state form (Will's error
+was an argument-shape trap, reproduced on Linux under the
+old binary — never a Windows bug). Old fleet states parse
+but stand at drifted addresses under the library — the
+fleet wipe/re-birth is Will's call, runbook prepared; GPG
+identities survive it (keyring lives beside the state).
+Gates: 50/50 tests, wiring 12/12, windows-gnu full link,
+sandbox against the live fleet signer, disk gate GREEN.
+Base is exo (v1.2.0, PR #15). See CHANGELOG 1.3.0.
+
+# qexo v1.2.1 (scratch line) — ship notes
+
+Status: v1.2.1 BUILT AND GATED, 2026-11-13 — the forecast
+rates growth from the median of the most recent 7 intervals
+instead of the last interval alone (the 2026-11-13 nightly
+evaluation's one change; see CHANGELOG 1.2.1 and
+EVALUATIONS.md 2026-11-13). Gates, all on aletheia-core
+(Tctl 30.5 °C at start, 53.1 °C peak during the release
+build — under the 75 °C pause line): `cargo test --release`
+50 passed, 0 failed (48 pre-existing, unmodified, plus the
+two new forecast tests); `qexo wiring-check` ok (12 module
+files); the release binary born a throwaway node in /tmp and
+emitted its plan — gate GREEN by the volume lens on the
+3,663 GiB incident volume, forecast unavailable on the first
+run and single-interval basis on the second, as designed.
+Base is exo (v1.2.0, PR #15 @ 833e2f34), fresh-cloned for
+this cycle; the stale local v3.2 mirror was not used. PR
+#16 (v1.3.0) is open against the same base; the only overlap
+is the version stamps — merge order is stated in the PR.
 
 # qexo v1.2.0 (scratch line) — ship notes
 
@@ -195,3 +371,4 @@ sparse_patterned_addresses_roundtrip.
 - json grep audit: 'json' in src/ only inside src/infer.rs
   (the translation module) and one rule-stating comment in
   src/lattice.rs.
+

@@ -2,7 +2,7 @@
 //!
 //! Two layers. The FILESYSTEM facts: the state directory exists
 //! and is writable, the state file exists and parses as phext,
-//! the GPG keyring directory is private (0700, on unix — modes
+//! the keyring directory (gnupg) is private (0700, on unix — modes
 //! do not exist elsewhere and the finding says so), no stale
 //! state lock is held by a dead process. The LATTICE facts (Layer 2):
 //! the home index and every homeland index exist, and every
@@ -346,6 +346,7 @@ pub fn check_lattice(lat: &Lattice) -> Report {
         (lattice::HL_MAIL, "mailbox & sessions index"),
         (lattice::HL_TELEMETRY, "telemetry index"),
         (lattice::HL_CONFIG, "config & wiring index"),
+        (lattice::HL_LEARN, "lessons & learning index"),
     ] {
         let addr = lattice::index_addr(h);
         findings.push(Finding {
@@ -413,6 +414,7 @@ pub fn fix_lattice(lat: &mut Lattice) -> Vec<String> {
         (lattice::index_addr(lattice::HL_MAIL), "mailbox & sessions index"),
         (lattice::index_addr(lattice::HL_TELEMETRY), "telemetry index"),
         (lattice::index_addr(lattice::HL_CONFIG), "config & wiring index"),
+        (lattice::index_addr(lattice::HL_LEARN), "lessons & learning index"),
     ];
     let before: Vec<Option<String>> = watched.iter().map(|(a, _)| lat.px.get(a).cloned()).collect();
     lattice::regen_indexes(&mut lat.px);
