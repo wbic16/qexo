@@ -1,45 +1,417 @@
 # qexo changelog — the scratch line
 
-## 1.3.0 (v1.3.0) — the Android port, 2026-11-13
+## 1.6.0 (v1.6.0) — OpenPGP moves inside, 2026-11-14
 
-qexo runs on Android as a full phextnet node, in Termux: this
-repo (wbic16/qexo) carries the port; the source descends from
-wbic16/quarterexo @ 833e2f34 (v1.2.0) and the port is the diff.
-The phone holds durable state and a real GPG identity, which a
-browser tab cannot — that is why the port is Android, not web.
+**The gpg subprocess is gone.** Every OpenPGP operation —
+key generation, detached sign and verify, armored export,
+fingerprint and user-id reads — now runs in-process on the
+`pgp` crate (rpgp), a published RFC 4880/9580 implementation.
+DESIGN §8.7's rule is unchanged (qexo never hand-rolls
+OpenPGP); the delegate changed, the way v1.3.0 swapped the
+hand-rolled phext parser for libphext-rs. Nothing about the
+wire changes: signatures and keys are standard OpenPGP and
+cross with GnuPG in both directions, which the gates prove
+rather than assume.
 
-- Target: `aarch64-linux-android`, built with the Android NDK
-  (r27c) clang as linker. The codebase is dependency-free std
-  plus hand-rolled FFI, and the unix family carried almost
-  everything: bionic has statvfs (the v1.0.2 volume probe links
-  unchanged), /proc exists, PermissionsExt works. The link —
-  not the check — is the gate, per the v1.0.4 lesson.
-- State path: /var/lib/qexo is not writable under Termux. On
-  Android only, when QEXO_STATE is unset and the canonical
-  directory cannot be created, the node lives at
-  $HOME/.qexo/state.phext — and says so: config prints the
-  fallback note at birth, and `qexo status` prints the path in
-  use, as everywhere. Desktop behavior is untouched (the
-  fallback is cfg(target_os = "android")-scoped; the pick is a
-  pure function with a unit test that runs on any host).
-- Timers, told plainly: the automatic update/evolve timer is
-  a systemd unit and Android has no systemd. The installer's
-  capability probes (root, /run/systemd/system, systemctl)
-  all fail there, and on Android the report says exactly that
-  and names the manual act instead — run `qexo evolve` (or
-  `qexo update`) from Termux when you want a pass. No fake
-  success, no systemd unit texts printed at a phone.
-- GPG is unchanged: crypto still spawns the `gpg` tool, which
-  Termux provides as `pkg install gnupg`.
-- Phone route: Termux (F-Droid build) + the Tailscale app,
-  `pkg install gnupg`, place the qexo binary and chmod +x,
-  `qexo config` to birth the node, register the fleet signer
-  with its tailnet endpoint, set release_signer in the config
-  record, then `qexo update --check` / `qexo evolve --check`.
-- Honest limit, same shape as the Windows one: the binary is
-  built and LINKED on the ranch; no Android runtime exists
-  there, so execution on a real phone is the operator's
-  report, not a gate result.
+Why: a node that lives inside an Android app cannot spawn a
+subprocess, and the phone is qexo's primary control surface.
+This is also the change that lets wbic16/qexo (the Android
+repo) come current with this tree.
+
+- The key store moves into the same keyring directory
+  (`<state dir>/gnupg`, name and mode unchanged) under
+  `qexo-keys/`: `own.secret.asc` for the node's key, one
+  `<FINGERPRINT>.asc` per public key.
+- **No stranded keys:** a GnuPG-era keyring (pubring.kbx +
+  private-keys-v1.d) migrates transparently on first use —
+  format conversion only, originals never modified, the
+  fingerprint (and so the node's identity, its peer
+  registrations, and its release-signer trust) unchanged.
+  A passphrase-protected legacy key is refused by name, and
+  key generation will not birth a replacement over it.
+- `qexo config` no longer requires `gpg` on the node at all;
+  new node key records say `suite: internal (rpgp)`.
+- encrypt_to/decrypt (the persona keychain exchange) are
+  rpgp-backed as well; no caller-visible behavior change.
+
+## 1.5.0 (v1.5.0) — Learn You a qexo!, 2026-11-14
+
+**The learn wizard.** `qexo learn` on a terminal is now a
+guided wizard in the Learn You a Haskell spirit, built at
+Will's direction ("qexo learn needs to be a learnyouqexo
+wizard TUI"). The engine is untouched — same 22-card deck,
+same SM-2-lite scheduling, same records in state.phext —
+only the surface changed:
+
+- A chapter map of qexo's capabilities: seven chapters from
+  First steps to The whole shelf, each with its mastery and
+  due counts.
+- A short lesson screen per chapter, in a playful-but-plain
+  voice drawn only from the shipped CLI's actual behavior.
+- Practice interleaved with the lessons: a chapter's due
+  cards, or the whole due queue (stalest first, as before).
+- The progress header rides every screen: mastered, due,
+  session streak, next due.
+- Keyboard-first: space reveals, 1/2/3 grade (a/g/e too),
+  b returns to the map, d jumps to the due queue, q quits
+  from anywhere. Progress saves after every card, as before.
+- Phone-terminal-first: every line wraps to the terminal
+  width (40 columns when the size is unknown — the Termux
+  shape). Unix runs cbreak mode via std-only termios; where
+  raw mode is unavailable (Windows) the same screens run in
+  line mode. Piped stdin still gets the status view and
+  --status still never writes.
+
+## 1.4.2 (v1.4.2) — the learn-resolution refinement, 2026-11-14
+
+**A regression v1.4.1 introduced, caught by its own
+crates.io consumer proof:** v1.4.1 classified `qexo learn
+--status` as write-intending. On a machine with a readable
+root-owned system state but NO per-user state yet, resolution
+diverted to the missing per-user path and `learn --status`
+errored "not born yet" — where v1.4.0 answered from the
+readable deck. A consumer installing qexo on a fleet node
+met a wall where 1.4.0 had given an answer.
+
+**The refinement:** learn carries a preference, not a write
+intent, in its `--status` form. When a per-user state
+EXISTS, `qexo learn` (both forms) selects it over the system
+state — the deck is the operator's own, which was defect
+#3's substance. When none exists, learn falls through to
+the shipped resolution order and answers from whatever deck
+is readable, exactly as v1.4.0 did. Sessions remain
+write-intending (they save grades), so a session with no
+node of one's own still points at `qexo config` — which
+births the per-user node — instead of dying on a save.
+Everything else in 1.4.1 stands unchanged.
+
+## 1.4.1 (v1.4.1) — the upgrade-path hotfix, 2026-11-14
+
+**The defect, stated plainly:** v1.4.0's update post-check ran
+doctor in check mode against the state the node inherited.
+States born under 1.3.0 carry no lessons homeland (10.10.10),
+so the new doctor's only complaint was a missing homeland
+index — a finding doctor itself marks fixable. The post-check
+failed anyway, the rollback restored 1.3.0, and the rollback
+removed the only binary that could run the fix. The fleet
+refused 1.4.0 fleet-wide, cleanly, with receipts. The battery
+had never updated a predecessor-born state — every test state
+was 1.4.0-born.
+
+**The fix is two layers.** (1) State top-up on write: every
+`Lattice::save` first seeds any homeland index scroll the
+current Layer 2 layout defines that the document lacks — an
+upgraded state becomes whole by the running binary's own hand,
+idempotently, touching nothing that already exists. Read and
+--check paths never write, so their byte-inert guarantees
+stand. (2) Post-check repair distinction: when the swapped
+binary's doctor fails, the new binary's own `doctor --fix`
+runs, repairs only what doctor labels fixable, and the check
+runs again; repairs are named in the update receipt and in the
+console. Hard problems (an unparseable state, a missing
+keyring) still roll back. A reload-before-receipt step keeps
+the receipt save from clobbering repairs the new binary made.
+
+**The missing regression gate is now standing:** a real
+1.3.0-born state (tests/fixtures/state-1.3.0.phext, born by
+the published 1.3.0 binary's own `qexo config`, never
+hand-edited) rides a full signed two-node update in the
+battery — the offer must be accepted, the learn index present
+after, doctor clean, the repair on the receipt — and the same
+fixture is an in-crate test for every future version.
+
+**Three field defects from Will's v1.4.0 install, folded in.**
+(1) URLs from `qexo list` didn't connect from aletheia-core.
+Diagnosis on the node: a bare hostname resolves to the
+machine's LAN address (aletheia-core → 127.0.1.1, rock-mountain
+→ its 192.168 address), where serve does not listen — and the
+live fleet display printed `http://peer-768b2a06:8484`, a
+synthetic record name dressed as a hostname, which names
+nothing at all. Only the fully-qualified tailnet name
+(`*.pizzly-halfmoon.ts.net`, carried in resolv.conf's search
+line) resolved to where serve listens. Now: `list` prints the
+fully-qualified tailnet form where a hostname is known
+(host: from the key, else a real record name), the recorded
+endpoint verbatim where no hostname exists (a tailnet IP
+connects as printed), and the node's own serve URL on its
+self line; `register` records a bare tailnet-IP endpoint in
+its DNS form when the hostname is known. (2) Public keys are
+never shortened: fingerprints print in full — all 40 hex —
+everywhere a human reads them (list, status, register, update,
+evolve, receipts as printed, index scrolls). (3) `qexo learn`
+couldn't run as a standard user: resolution tested existence
+plus readability, which hands an unprivileged user the
+fleet's root-owned state — and the first save dies with
+Permission denied. Resolution is intent-aware now: a
+write-intending verb in unprivileged hands selects the
+per-user state whenever the system state is not writable by
+it (learn in both forms, config, register, plan, the apply
+modes, doctor --fix); read-only verbs keep the v1.4.0 order
+exactly, and root's fleet behavior is unchanged.
+
+## 1.4.0 (v1.4.0) — built and gated, 2026-11-14
+
+**The install model changes: qexo no longer assumes root.**
+Through v1.3.0 the state path was /var/lib/qexo/state.phext,
+full stop — so the first person to `cargo install qexo` and
+run it as themselves met permission walls: read verbs wanted
+sudo, and a fresh `qexo config` needed root to birth. v1.4.0
+resolves the state path, in this order: QEXO_STATE when set;
+the system path /var/lib/qexo/state.phext when it exists and
+is readable; the per-user path ~/.qexo/state.phext (Windows:
+under the user profile) when a per-user state exists; the
+system path again when it exists unreadable with no per-user
+state (the honest error names the real file); and for a fresh
+birth, the system path for a privileged process, the per-user
+path otherwise — with a birth-time fallback to the per-user
+path, announced out loud, when the system directory cannot be
+created by the user running `qexo config`. Read-only verbs
+never require sudo and never fail on system-path permissions
+when a per-user state exists; a per-user node is whole — state
+and GPG keyring side by side under ~/.qexo. A node has ONE
+state: resolution finds the first that exists, `qexo status`
+names the live path, and there is no migration — no per-user
+deployments existed to migrate from. System installs are
+unchanged, byte-for-byte: root's /var/lib/qexo stays canonical
+wherever it exists and is readable (the fleet runs exactly
+that, untouched).
+
+**`qexo list` is a navigation tree now.** The phextnet renders
+rooted at the peers anchor 3.3.3/3.3.3/3.3.3: this node first
+and marked, each peer nested under its record address with its
+name, status (registered/discovered), and endpoint — Phext
+Notepad style, plain ASCII-safe branch marks. `list --json`
+keeps the flat machine shape (JSON is the interop gasket,
+unchanged); the serve route /v1/peers keeps the flat text form.
+
+**Peers have names: the host: field.** At register, the peer's
+host name is read from its key's user id ("qexo node <host>
+(qexo node key)") and recorded as the record's host: field;
+re-registering backfills it on records that predate it, and
+gossip carries it into discovered records. Displays — the list
+tree, status, update and evolve output — show hostnames, and
+an endpoint whose authority is a bare IPv4 address is shown
+by name instead; the recorded endpoint is never rewritten
+(polling dials what the operator registered) and a bare IP
+surfaces only when no name is known. Records that predate
+host: display by their record name with no rewrite — for the
+fleet those names ARE the tailnet hostnames. The fleet
+convention (name = tailnet hostname; register by hostname
+endpoint) is written into the register/config help text.
+
+**`qexo learn` — spaced repetition over qexo's own surface.**
+A 22-card curriculum deck lives in a new Layer 2 homeland —
+10.10.10/10.10.10/10.10.10, lessons & learning (the tens:
+practice, repeated) — one scroll per card at cluster 2, front
+and back as field lines, scheduling fields (due,
+interval_days, ease, reps, lapses) updated in place by
+practice. The deck ships with the binary and seeds into state
+on the first session, never overwriting a card already in
+state. Cards cover every verb, the trust model (signer, GPG,
+discovery-is-never-trust), the phextnet shape, and the state
+homelands, each checked against --help. SM-2-lite: again =
+lapse, interval 1d, ease −0.20 (floor 1.3), reps reset; good =
+1d then interval × ease; easy = 3d then interval × ease × 1.3,
+ease +0.15. Mastered = interval ≥ 21 days. Interactive
+sessions run due cards (Enter to reveal, grade 1/2/3, saved
+after every card); --status reports deck/due/mastered without
+writing; piped stdin prints the status view instead of
+hanging.
+
+**`qexo inventory` (alias `catalog`) — the ecosystem roster.**
+A baked, phext-native roster of the phext ecosystem: every
+product with what it is, its home, and its install/launch
+lines. The roster is a census, not a hand list — all 201
+wbic16 GitHub repos were enumerated and their outputs judged;
+only products with a verified published artifact are baked
+(crates.io / PyPI / npm packages, GitHub release assets, a
+live hosted product, or a documented library): 11 entries,
+each carrying its verification evidence and the census date
+(2026-11-14). `qexo inventory <name>` prints one full record;
+`--install <name>` is print-only — qexo never installs
+ecosystem products silently. Notable exclusions, all in the
+census record: phext-mcp (its README documents a cargo
+install command for a crate that does not exist on crates.io),
+md2phext and the Android port and exo-search (real tools, no
+published artifact yet), and three name-collision crates
+(weft, tersify, hello-phext) that are NOT Will's.
+
+The parser layer is untouched: the conformance census against
+the libphext 0.6.0 probe is unchanged from v1.3.0.
+
+## 1.3.0 (v1.3.0) — built and gated, 2026-11-13
+
+**libphext-rs is the parser now.** qexo no longer reckons
+phext itself: `src/phext.rs` is a thin adapter over the
+`libphext` crate (pinned `0.6.0` from the crates.io registry;
+the slice was first built against 0.5.0 and re-gated on
+0.6.0 — the chains release: 0x02 chain break, 0x03 chain
+close, $N: universe addressing — before merge), and address
+computation, delimiter emission, and duplicate-address
+behavior are the library's, full stop. The adapter's used
+surface (`explode` / `implode` / `Coordinate`) is unchanged
+in 0.6.0, so the bump is the pin alone; qexo builds no chain
+features in this slice.
+
+Under 0.6.0 the old-state verdict sharpens: a state written
+by the hand-rolled serializer is, to a chain-aware reader, a
+chain — its 0x02 library breaks are chain separators — and
+`parse_chains` recovers each old library whole as its own
+universe, every record at its exact universe-relative
+address (the universe index carries the old Library number;
+measured on aletheia-core's fleet state: 9 members, 106
+scrolls, config record at $9:1.9.9/2.1.1/1.1.1 with its
+signer intact — see the build record). The chain reads as
+unclosed (the old serializer never wrote a 0x03), which the
+format flags as possibly truncated; the nine complete
+homelands say otherwise for these files. qexo's own reader
+stays the single-phext `explode`, under which old states
+still parse to drifted addresses and remain unusable as
+state; the fleet wipe and rebirth stands. The chain reading
+matters as archaeology: nothing in an old state is lost to
+a reader willing to read it as a chain.
+
+Why, in one paragraph: through v1.2.0 qexo carried a
+hand-rolled parser whose delimiter table diverged from
+libphext in exactly one byte — its library break was \x02
+(STX) where the reference uses \x01 (SOH); the other eight
+breaks agreed. The divergence was invisible for seven
+versions because qexo only ever read files qexo wrote. It
+surfaced on 2026-11-13 when Will edited his laptop node's
+config record in Phext Notepad to set `release_signer`, and
+`qexo update` kept refusing: the editor's append (SOH×10,
+US×8, RS×8, GS×1, then the filled signer scroll, appended
+after the 9.9.9 homeland anchor) landed at 9.17.9/2.1.1/1.1.1
+under qexo's reckoning, at 11.9.9/2.1.1/1.1.1 under
+libphext's (measured identically with SQ 0.6.0 / libphext
+0.3.3 and with libphext 0.5.0 before this slice was built) —
+and under neither reckoning does the append shadow the
+config record, whose signer line stayed empty. A file is
+only phext if the reference implementation reads it the
+same way; now there is one reckoning in the codebase,
+imported, not re-derived.
+
+What the adapter keeps: qexo's document model (a BTreeMap
+of [u32; 9] coordinates to scroll texts — the shape
+lattice.rs and the Layer 2 addressing are written against),
+its coordinate string grammar, and the format's own rule
+that a scroll exists when it holds at least a byte
+(libphext's explode also names the empty stops on a climb;
+the adapter keeps only scrolls with text). Nothing else in
+the old phext.rs was genuinely qexo-specific.
+
+Regressions added: `library_break_is_soh_not_stx` (the
+one-byte divergence, pinned) and
+`editor_append_lands_where_libphext_puts_it` (tonight's
+file shape byte-for-byte as a fixture: the signer scroll at
+11.9.9/2.1.1/1.1.1, nothing at the hand-rolled parser's
+9.17.9/2.1.1/1.1.1, the config record unshadowed and itself
+found at 1.37.9/2.1.1/1.1.1 under the library's walk of an
+old-serializer file). All 48 pre-existing tests pass
+unmodified — none encoded the divergent behavior, which is
+precisely how it survived: every test roundtripped through
+qexo's own serializer. 50/50 with the two new ones.
+
+Siblings in this slice:
+
+- `qexo config --release-signer <FP>` — the trusted signer
+  fingerprint becomes a command (written into the config
+  record via the lattice field editor, on birth and on
+  re-run alike) instead of a hand edit of the scroll from
+  another tool — the gap that started the evening.
+- `qexo select <coord>` — the verb gains the state form
+  Will reached for: one argument that parses as a coordinate
+  reads this node's state. The error he hit ("<coord>: The
+  system cannot find the path specified. (os error 3)") was
+  never a platform bug: the verb took its first argument as
+  a file path unconditionally, so the coordinate was opened
+  as a path. Reproduced on Linux with the v1.2.0 binary
+  ("No such file or directory (os error 2)", exit 2); the
+  two-argument file form is unchanged, and a bare verb now
+  prints usage instead of inventing a path.
+
+Old-state verdict (states written by the hand-rolled
+serializer — i.e. every fleet node today), measured with
+this build against a copy of aletheia-core's live state:
+the file parses cleanly and every scroll's text survives
+(106/106), but the records stand at drifted addresses under
+the library's walk — doctor finds the home index (Library
+1 is unaffected) and reports all eight higher homeland
+indexes missing; the node key record, the peer registry,
+and the config record (signer included) are unreadable at
+their Layer 2 addresses. A v1.2.0 state is therefore not
+salvageable as state: the fleet will be wiped and re-born
+under the corrected parser (runbook prepared separately).
+What survives a wipe untouched: the node's GPG identity —
+the keyring lives in /var/lib/qexo/gnupg beside the state,
+and config reuses it on rebirth, so node fingerprints stand
+— plus every .asc and fingerprint in the fleet registry,
+from which the peer wiring is rebuilt.
+
+Version note: wbic16/qexo's Android port also wears 1.3.0
+in its own repo lineage — versions are per-repo; this is
+quarterexo's 1.3.0.
+
+Gates: cargo test 50/50; release build; wiring-check 12/12;
+full windows-gnu LINK (qexo.exe, GetDiskFreeSpaceExW
+imported, no statvfs); sandbox — birth, the new setter,
+both select forms, register + `update --check` against the
+live fleet signer ("already current — this node runs qexo
+1.3.0; the trusted signer offers 1.2.0"), `evolve --check`
+gossiping the real fleet, bare plan disk gate GREEN on the
+ranch volume (74% free, volume lens).
+
+## 1.2.1 (v1.2.1) — built and gated, 2026-11-13
+
+The forecast stops whipsawing: growth is rated from the
+median interval, not the last one. The nightly cycle's one
+change, from the 2026-11-13 evaluation of 2026-11-12
+(EVALUATIONS.md): v1.2.0's `forecast_gate` rated growth from
+the history's last two observations, so the nearest-crossing
+estimate swung with whatever the last day happened to do —
+file AMBER read ~1.4 days out on the 2026-11-10 disk-watch
+interval, ~12–14 days out on 2026-11-11's, and ~9.9 days out
+on 2026-11-12's, while the underlying series never changed
+character. A warning that moves ten days in a night is not a
+warning anyone can plan a staging move around.
+
+What changes, all inside `src/plan.rs`:
+
+- The rates are the median of the per-interval rates over
+  the most recent 7 intervals (`FORECAST_WINDOW_INTERVALS`);
+  older intervals fall out of the window instead of anchoring
+  the rate forever. A history with exactly two observations
+  keeps the pre-v1.2.1 single-interval rate unchanged — every
+  pre-existing forecast test passes unmodified.
+- `Forecast` gains `intervals` (how many interval rates the
+  reported rates are the median of), and the rendered
+  forecast line names its basis: "median of N intervals,
+  X d" (or "last interval, X d" for the two-observation
+  case). `span_days` is now the window's span.
+- On the real disk-watch series (2026-11-08 → 2026-11-12:
+  file intervals +124,074 / +59,021 / +5,372 / +7,064 per
+  day) the median rates +33,043 files/day and +2.84 GB/day
+  and projects file AMBER ~2.1 days out — against the
+  single-interval +7,064/day and ~9.9 days the same history
+  produced the night before.
+- New tests: `forecast_median_damps_single_interval_whipsaw`
+  (the real series above, with the single-interval contrast
+  asserted in the same test) and
+  `forecast_window_excludes_old_spike` (a +400,000-file
+  interval eight intervals back is outside the window, not
+  merely damped).
+- Nothing else changes: the gate's lenses, thresholds, and
+  verdicts are v1.2.0's; the forecast still escalates GREEN
+  only, still projects only the node's configured lenses
+  (v1.0.3), and still degrades to unavailable on fewer than
+  two observations.
+- Version: Cargo 1.2.0 → 1.2.1; VERSION v1.2.1; the plan
+  payload reports `plan_version: v1.2.1`.
+- Ordering note: PR #16 (v1.3.0, libphext-rs as the parser)
+  is open against the same base (exo @ 833e2f34). This
+  change does not touch `src/phext.rs`; the only overlap is
+  the version stamps. Merge this PR before #16, or rebase
+  its stamps to v1.3.1 after — either order lands both.
 
 ## 1.2.0 (v1.2.0) — built and gated, 2026-11-13
 
@@ -354,3 +726,4 @@ holds the scroll-existence rule — the single-delimiter form
 could not represent the homeland addresses at all. Gates:
 29/29 cargo tests, 59/59 CLI battery, wiring ok, json confined
 to the inference edge and one rule-stating comment.
+

@@ -33,7 +33,7 @@ fn hostname() -> String {
 }
 
 /// (epoch day number, "YYYY-MM-DD HH:MM UTC") for right now.
-fn now_stamp() -> (i64, String) {
+pub(crate) fn now_stamp() -> (i64, String) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -48,7 +48,7 @@ fn now_stamp() -> (i64, String) {
 }
 
 /// Inverse of plan::days_from_civil (Hinnant's civil_from_days).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -61,7 +61,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn require_born() -> Result<Lattice, i32> {
+pub(crate) fn require_born() -> Result<Lattice, i32> {
     match Lattice::load() {
         Ok(Some(lat)) => Ok(lat),
         Ok(None) => {
@@ -235,24 +235,52 @@ fn evolve_enabled(lat: &Lattice) -> bool {
         .unwrap_or(false)
 }
 
-pub fn config(auto_update: bool, evolve: bool) -> i32 {
-    let dir = lattice::state_dir();
-    let path = lattice::state_path();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("qexo config: cannot create {}: {}", dir.display(), e);
-        return 1;
-    }
-    let node = hostname();
-    let gpg = Gpg::open_in(&dir);
+/// `qexo config --release-signer <FP>`: the operator's act of
+/// trust as a command, instead of a hand edit of the config
+/// scroll (the gap Will hit on 2026-11-13, setting the signer
+/// from Phext Notepad because no setter existed). Writes the
+/// fingerprint into the config record's `release_signer` field
+/// line, via the lattice's field editor; the record itself is
+/// config's seeding, created before this runs when absent.
+fn apply_release_signer(lat: &mut Lattice, signer: &str) {
+    let mut text = lat
+        .px
+        .get(&lattice::CONFIG_RECORD)
+        .cloned()
+        .unwrap_or_else(|| "kind: qexo config\n".to_string());
+    text = lattice::set_field(&text, "release_signer", signer);
+    lat.px.insert(lattice::CONFIG_RECORD, text);
+}
 
-    let mut lat = match Lattice::load() {
-        Ok(Some(l)) => l,
-        Ok(None) => Lattice::born(path.clone()),
+pub fn config(auto_update: bool, evolve: bool, release_signer: Option<String>) -> i32 {
+    let node = hostname();
+    // Resolution first (the order is stated in lattice.rs): an
+    // existing state — system or per-user — IS the node. Only a
+    // birth picks a fresh path, and the birth path falls back to
+    // the per-user home when the system directory is out of this
+    // user's reach, so a plain `cargo install qexo` user births a
+    // node with no sudo anywhere in the loop.
+    let (mut lat, fell_back) = match Lattice::load() {
+        Ok(Some(l)) => (l, false),
+        Ok(None) => {
+            let (bp, fb) = lattice::birth_path();
+            (Lattice::born(bp), fb)
+        }
         Err(e) => {
             eprintln!("qexo config: cannot load state: {}", e);
             return 1;
         }
     };
+    let path = lat.path().clone();
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/var/lib/qexo"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("qexo config: cannot create {}: {}", dir.display(), e);
+        return 1;
+    }
+    let gpg = Gpg::open_in(&dir);
 
     // Idempotent: a node key record already in the lattice means
     // this node is born; say so and stop — but first backfill any
@@ -263,17 +291,29 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
         let mut added = ensure_gate_config(&mut lat);
         added.extend(ensure_update_config(&mut lat));
         added.extend(ensure_evolve_config(&mut lat));
-        if !added.is_empty() {
+        let signer_set = match &release_signer {
+            Some(signer) => {
+                apply_release_signer(&mut lat, signer);
+                true
+            }
+            None => false,
+        };
+        if !added.is_empty() || signer_set {
             lattice::regen_indexes(&mut lat.px);
             if let Err(e) = lat.save() {
                 eprintln!("qexo config: cannot save state: {}", e);
                 return 1;
             }
-            println!("config defaults added: {}", added.join(", "));
+            if !added.is_empty() {
+                println!("config defaults added: {}", added.join(", "));
+            }
         }
         println!("already configured — this node was born {}", lattice::field(lat.px.get(&lattice::IDENTITY).map(|s| s.as_str()).unwrap_or(""), "born").unwrap_or_default());
         println!("state: {}", path.display());
         println!("node key fingerprint: {}", fp);
+        if let Some(signer) = &release_signer {
+            println!("release signer set: {}", signer);
+        }
         println!("home: {}", fmt_coord(&lattice::HOME));
         if evolve {
             let code = finish_evolve_flag();
@@ -294,10 +334,6 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
     let fp = match existing.last() {
         Some(f) => f.clone(),
         None => {
-            if !crate::crypto::gpg_available() {
-                eprintln!("qexo config: gpg is not available on this node; the node key cannot be set up");
-                return 1;
-            }
             match gpg.generate(&format!("qexo node {}", node), "qexo node key") {
                 Ok(f) => f,
                 Err(e) => {
@@ -317,6 +353,7 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
 
     let (_, stamp) = now_stamp();
     let name = format!("qexo node {}", node);
+    let birth_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     lat.px.insert(
         lattice::IDENTITY,
         lattice::record(&[
@@ -324,7 +361,7 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
             ("name", &name),
             ("node", &node),
             ("born", &stamp),
-            ("qexo", "v1.3.0"),
+            ("qexo", &birth_version),
             ("state", &path.display().to_string()),
         ]),
     );
@@ -334,7 +371,7 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
             ("kind", "node key"),
             ("name", &name),
             ("fingerprint", &fp),
-            ("algorithm", "eddsa/ed25519, suite: gpg"),
+            ("algorithm", "eddsa/ed25519, suite: internal (rpgp)"),
             ("status", "active"),
             ("issued", &stamp),
             ("public key", &fmt_coord(&lattice::NODE_KEY_PUBLIC)),
@@ -381,7 +418,7 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
     let wiring_first8 = [9, 9, 9, 2, 1, 1, 1, 1];
     if lattice::prefix_scrolls(&lat.px, &wiring_first8).is_empty() {
         let mut modules = vec![
-            "cli", "core", "crypto", "doctor", "hash", "infer", "lattice", "phext", "plan", "wiring", "xz",
+            "cli", "core", "crypto", "doctor", "hash", "infer", "inventory", "lattice", "learn", "phext", "plan", "wiring", "xz",
         ];
         modules.sort();
         for (i, m) in modules.iter().enumerate() {
@@ -390,6 +427,9 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
         }
     }
 
+    if let Some(signer) = &release_signer {
+        apply_release_signer(&mut lat, signer);
+    }
     let receipt = append_receipt(&mut lat.px, "config", &[("note", "node born; state.phext initialized with the homeland map")]);
     lattice::regen_indexes(&mut lat.px);
     if let Err(e) = lat.save() {
@@ -397,13 +437,19 @@ pub fn config(auto_update: bool, evolve: bool) -> i32 {
         return 1;
     }
     println!("node born: {}", name);
-    println!("state: {}", path.display());
-    if lattice::state_path_is_fallback() {
-        println!("note: /var/lib/qexo is not writable on this device (Android/Termux), so the node lives under $HOME — set QEXO_STATE to move it");
+    if fell_back {
+        println!(
+            "note: /var/lib/qexo is not writable by this user, so this node lives per-user — state and keyring under {} (no sudo needed, ever)",
+            dir.display()
+        );
     }
+    println!("state: {}", path.display());
     println!("node key fingerprint: {}", fp);
     println!("home index: {}", fmt_coord(&lattice::HOME));
     println!("birth receipt: {}", fmt_coord(&receipt));
+    if let Some(signer) = &release_signer {
+        println!("release signer set: {}", signer);
+    }
     if evolve {
         let code = finish_evolve_flag();
         if code != 0 {
@@ -681,6 +727,26 @@ pub fn register(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // The peer's host name rides in its key's user id ("qexo node
+    // <hostname> (qexo node key)") — read from the key itself,
+    // like the fingerprint, never from the caller's say-so. It is
+    // recorded as the record's host: field (backfilled on
+    // re-register for records that predate it), so displays name
+    // the machine instead of surfacing a bare address.
+    let host = gpg.name_of(&armored).ok().and_then(|uid| host_from_uid(&uid));
+    // Endpoint recording (v1.4.1): when the peer's hostname is
+    // known from its key and the given endpoint is a bare
+    // tailnet IP, record the endpoint in its fully-qualified
+    // DNS form — the form polling can dial (MagicDNS resolves
+    // it on any tailnet node) AND the form a human copying it
+    // out of `qexo list` can open. The choice is named out loud.
+    if let (Some(ep), Some(h)) = (&endpoint, &host) {
+        let normalized = recorded_endpoint(h, ep, tailnet_domain().as_deref());
+        if normalized != *ep {
+            println!("endpoint recorded in tailnet DNS form: {}", normalized);
+            endpoint = Some(normalized);
+        }
+    }
     for (cluster, addr, text) in peer_records(&lat.px) {
         if lattice::field(&text, "fingerprint").as_deref() == Some(fp.as_str()) {
             if lattice::field(&text, "status").as_deref() == Some("discovered") {
@@ -690,7 +756,7 @@ pub fn register(args: &[String]) -> i32 {
                 // is promoted in place; its via/discovered lines
                 // stay, as provenance of how it was first met.
                 if let Err(e) = gpg.import_public(&armored) {
-                    eprintln!("qexo register: gpg import failed: {}", e);
+                    eprintln!("qexo register: key import failed: {}", e);
                     return 1;
                 }
                 let (_, stamp) = now_stamp();
@@ -700,6 +766,9 @@ pub fn register(args: &[String]) -> i32 {
                 let mut rec = lattice::set_field(&text, "status", "registered");
                 rec = lattice::set_field(&rec, "registered", &stamp);
                 rec = lattice::set_field(&rec, "public key", &fmt_coord(&key_addr));
+                if let Some(h) = &host {
+                    rec = lattice::set_field(&rec, "host", h);
+                }
                 if let Some(ep) = &endpoint {
                     rec = lattice::set_field(&rec, "endpoint", ep);
                 }
@@ -737,17 +806,31 @@ pub fn register(args: &[String]) -> i32 {
                 return 0;
             }
             // Already known — but an endpoint named now backfills
-            // the record (the peer becomes pollable).
+            // the record (the peer becomes pollable), and the
+            // host name read from the key backfills beside it for
+            // records that predate the host: field.
+            let mut updated = text.clone();
+            let mut changed = false;
             if let Some(ep) = &endpoint {
-                if lattice::field(&text, "endpoint").as_deref() != Some(ep.as_str()) {
-                    let updated = lattice::set_field(&text, "endpoint", ep);
-                    lat.px.insert(addr, updated);
-                    lattice::regen_indexes(&mut lat.px);
-                    if let Err(e) = lat.save() {
-                        eprintln!("qexo register: cannot save state: {}", e);
-                        return 1;
-                    }
+                if lattice::field(&updated, "endpoint").as_deref() != Some(ep.as_str()) {
+                    updated = lattice::set_field(&updated, "endpoint", ep);
+                    changed = true;
                     println!("endpoint recorded for {}: {}", lattice::field(&text, "name").unwrap_or_default(), ep);
+                }
+            }
+            if let Some(h) = &host {
+                if lattice::field(&updated, "host").as_deref() != Some(h.as_str()) {
+                    updated = lattice::set_field(&updated, "host", h);
+                    changed = true;
+                    println!("host recorded for {}: {}", lattice::field(&text, "name").unwrap_or_default(), h);
+                }
+            }
+            if changed {
+                lat.px.insert(addr, updated);
+                lattice::regen_indexes(&mut lat.px);
+                if let Err(e) = lat.save() {
+                    eprintln!("qexo register: cannot save state: {}", e);
+                    return 1;
                 }
             }
             println!("already registered at {}", fmt_coord(&addr));
@@ -756,7 +839,7 @@ pub fn register(args: &[String]) -> i32 {
         }
     }
     if let Err(e) = gpg.import_public(&armored) {
-        eprintln!("qexo register: gpg import failed: {}", e);
+        eprintln!("qexo register: key import failed: {}", e);
         return 1;
     }
     let (_, stamp) = now_stamp();
@@ -773,6 +856,9 @@ pub fn register(args: &[String]) -> i32 {
         ("registered", &stamp),
         ("public key", &key_coord),
     ];
+    if let Some(h) = &host {
+        peer_fields.push(("host", h.as_str()));
+    }
     if let Some(ep) = &endpoint {
         peer_fields.push(("endpoint", ep.as_str()));
     }
@@ -799,9 +885,200 @@ pub fn register(args: &[String]) -> i32 {
         return 1;
     }
     println!("registered {} at {}", name, fmt_coord(&addr));
+    if let Some(h) = &host {
+        println!("host: {}", h);
+    }
     println!("fingerprint: {}", fp);
     println!("receipt: {}", fmt_coord(&receipt));
     0
+}
+
+/// A host name from a node key's user id: "qexo node <host>
+/// (qexo node key)" gives <host>; a bare uid gives itself minus
+/// any trailing parenthetical comment. None when nothing usable
+/// remains — the display fallback (the record name) then rules.
+fn host_from_uid(uid: &str) -> Option<String> {
+    let mut s = uid.trim();
+    if let Some(rest) = s.strip_prefix("qexo node ") {
+        s = rest;
+    } else if s == "qexo node" {
+        s = "";
+    }
+    if s.ends_with(')') {
+        if let Some(i) = s.rfind(" (") {
+            s = s[..i].trim_end();
+        }
+    }
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// The name a peer is shown by: its host: field when one is
+/// recorded, else its record name. Records that predate host:
+/// need no rewrite for display — the fleet's record names ARE
+/// their tailnet hostnames, so the fallback is already a name.
+pub(crate) fn peer_display_name(text: &str) -> String {
+    match lattice::field(text, "host") {
+        Some(h) if !h.is_empty() => h,
+        _ => lattice::field(text, "name").unwrap_or_default(),
+    }
+}
+
+/// The tailnet DNS domain this machine resolves its peers
+/// under, when one is discoverable: the *.ts.net search domain
+/// the tailnet's MagicDNS leaves in /etc/resolv.conf.
+///
+/// Diagnosis (2026-11-14, from aletheia-core — the evidence
+/// behind every display rule below): a bare hostname resolves
+/// to the machine's LAN address (`aletheia-core` → 127.0.1.1,
+/// `rock-mountain` → its 192.168 address), where serve does
+/// not listen — connection refused. The fully-qualified
+/// tailnet name resolves to the tailnet address, where serve
+/// does listen — HTTP 200. The resolv.conf search line carries
+/// the domain on tailnet machines (`search lan
+/// pizzly-halfmoon.ts.net`), so the binary can learn it from
+/// the machine's own configuration instead of assuming it.
+pub(crate) fn tailnet_domain() -> Option<String> {
+    std::fs::read_to_string("/etc/resolv.conf").ok().and_then(|t| tailnet_domain_in(&t))
+}
+
+/// The pure half of the probe, for tests.
+fn tailnet_domain_in(resolv_conf: &str) -> Option<String> {
+    for line in resolv_conf.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("search") => {
+                for d in it {
+                    if d.ends_with(".ts.net") {
+                        return Some(d.to_string());
+                    }
+                }
+            }
+            Some("domain") => {
+                if let Some(d) = it.next() {
+                    if d.ends_with(".ts.net") {
+                        return Some(d.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A name in the form this machine can resolve: a dotted name
+/// stands as it is; a bare hostname gains the tailnet domain
+/// when one is known (and keeps its bare form when none is —
+/// off-tailnet, the old behavior is the honest fallback).
+fn fqdn_name(name: &str, domain: Option<&str>) -> String {
+    if name.contains('.') {
+        return name.to_string();
+    }
+    match domain {
+        Some(d) => format!("{}.{}", name, d),
+        None => name.to_string(),
+    }
+}
+
+/// The synthetic record name register gives a key whose uid
+/// names nothing: peer-<last 8 of the fingerprint>. Such a
+/// name is not a hostname and must never be dressed as one —
+/// the v1.4.0 fleet display printed http://peer-768b2a06:8484,
+/// a URL that names nothing and connects nowhere.
+fn is_synthetic_peer_name(text: &str) -> bool {
+    let name = lattice::field(text, "name").unwrap_or_default();
+    let fp = lattice::field(text, "fingerprint").unwrap_or_default();
+    !fp.is_empty() && name == format!("peer-{}", &fp[fp.len().saturating_sub(8)..].to_lowercase())
+}
+
+/// The name a peer's URL may be shown under: its host: field
+/// (a hostname by construction — read out of the peer's own
+/// key uid at register), else its record name when that name
+/// is a real one. None when the record carries no hostname at
+/// all: the recorded endpoint then stands as the display,
+/// because a tailnet IP connects exactly as printed.
+fn peer_url_name(text: &str) -> Option<String> {
+    if let Some(h) = lattice::field(text, "host").filter(|s| !s.is_empty()) {
+        return Some(h);
+    }
+    let name = lattice::field(text, "name").unwrap_or_default();
+    if !name.is_empty() && !is_synthetic_peer_name(text) {
+        return Some(name);
+    }
+    None
+}
+
+/// The endpoint as shown to humans (v1.4.1): what `qexo list`
+/// prints as a URL must be a URL that connects from the node
+/// printing it. When the peer has a hostname, the fully-
+/// qualified tailnet form of it stands in the recorded bare
+/// IP's place (the only name form the diagnosis found
+/// resolving to where serve listens). When the record carries
+/// no hostname, the recorded endpoint stands verbatim. The
+/// recorded endpoint is never rewritten by display — polling
+/// keeps using exactly what the operator registered.
+pub(crate) fn peer_display_endpoint(text: &str) -> Option<String> {
+    peer_display_endpoint_d(text, tailnet_domain().as_deref())
+}
+
+/// The testable half: the domain is a parameter, never probed.
+fn peer_display_endpoint_d(text: &str, domain: Option<&str>) -> Option<String> {
+    let ep = lattice::field(text, "endpoint").filter(|s| !s.is_empty())?;
+    match peer_url_name(text) {
+        Some(name) => Some(display_endpoint_for(&fqdn_name(&name, domain), &ep)),
+        None => Some(ep),
+    }
+}
+
+/// The endpoint as RECORDED at register time (v1.4.1): when the
+/// given endpoint's authority is a bare IPv4 in the tailnet
+/// range (100.64.0.0/10) and the peer's hostname is known from
+/// its key, the fully-qualified tailnet form replaces the
+/// address in the record itself. Every other endpoint —
+/// hostname forms, LAN addresses, anything off-tailnet — is
+/// recorded exactly as the operator gave it.
+fn recorded_endpoint(host: &str, ep: &str, domain: Option<&str>) -> String {
+    let Some(d) = domain else { return ep.to_string() };
+    let Some((scheme, rest)) = ep.split_once("://") else { return ep.to_string() };
+    let (authority, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let host_part = authority.split(':').next().unwrap_or("");
+    let Ok(ip) = host_part.parse::<std::net::Ipv4Addr>() else { return ep.to_string() };
+    let o = ip.octets();
+    if o[0] != 100 || !(64..=127).contains(&o[1]) {
+        return ep.to_string();
+    }
+    format!("{}://{}{}{}", scheme, fqdn_name(host, Some(d)), &authority[host_part.len()..], tail)
+}
+
+/// The display substitution itself, for callers holding a name
+/// and an endpoint rather than a whole record (gossip's poll
+/// list): a bare-IPv4 authority is shown by name; anything else
+/// (a hostname endpoint, a name-less peer) stands as recorded.
+fn display_endpoint_for(name: &str, ep: &str) -> String {
+    if name.is_empty() {
+        return ep.to_string();
+    }
+    let Some((scheme, rest)) = ep.split_once("://") else {
+        return ep.to_string();
+    };
+    let (authority, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let host_part = authority.split(':').next().unwrap_or("");
+    if host_part.parse::<std::net::Ipv4Addr>().is_ok() {
+        format!("{}://{}{}{}", scheme, name, &authority[host_part.len()..], tail)
+    } else {
+        ep.to_string()
+    }
 }
 
 fn peers_text(lat: &Lattice) -> String {
@@ -814,7 +1091,7 @@ fn peers_text(lat: &Lattice) -> String {
         out.push_str(&format!(
             "{}  {}  {}  {}{}\n",
             lattice::field(text, "name").unwrap_or_default(),
-            lattice::fp_short(&lattice::field(text, "fingerprint").unwrap_or_default()),
+            lattice::field(text, "fingerprint").unwrap_or_default(),
             fmt_coord(addr),
             lattice::field(text, "status").unwrap_or_default(),
             lattice::field(text, "endpoint").map(|e| format!("  {}", e)).unwrap_or_default()
@@ -823,12 +1100,132 @@ fn peers_text(lat: &Lattice) -> String {
     out
 }
 
-pub fn list() -> i32 {
+/// This node's own serve URL, in the form that connects from
+/// this node itself (v1.4.1 — the tree's self line carried no
+/// URL at all in v1.4.0): when serve_bind is loopback, loopback
+/// is the truth; otherwise the node's own name in its fully-
+/// qualified tailnet form, which resolves to the tailnet
+/// address serve binds. The port is qexo's serve default —
+/// the bind record carries an address, not a port.
+fn self_serve_url(lat: &Lattice, domain: Option<&str>) -> String {
+    let bind = lat
+        .px
+        .get(&lattice::CONFIG_RECORD)
+        .and_then(|t| lattice::field(t, "serve_bind"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let host = if bind == "127.0.0.1" || bind == "localhost" || bind == "::1" {
+        "127.0.0.1".to_string()
+    } else {
+        match lat.px.get(&lattice::IDENTITY).and_then(|t| lattice::field(t, "node")).filter(|s| !s.is_empty()) {
+            Some(n) => fqdn_name(&n, domain),
+            None => bind.clone(),
+        }
+    };
+    format!("http://{}:8484", host)
+}
+
+/// The phextnet as a navigation tree (v1.4.0; URLs made true
+/// in v1.4.1): the peers homeland anchor as root, this node
+/// first and marked — with its own serve URL — each peer
+/// nested under its record address with its display name,
+/// status, and endpoint as a URL that connects from here.
+/// Plain ASCII-safe marks, the editor's style: indentation and
+/// +-- / \-- branch marks, nothing else. The tailnet domain
+/// is a parameter so the rendering is testable off-tailnet.
+fn peers_tree(lat: &Lattice, domain: Option<&str>) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{} — peers\n", fmt_coord(&lattice::index_addr(lattice::HL_PEERS))));
+    let node = lat
+        .px
+        .get(&lattice::IDENTITY)
+        .and_then(|t| lattice::field(t, "node"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "this node".to_string());
+    let fp = lat
+        .px
+        .get(&lattice::NODE_KEY_RECORD)
+        .and_then(|t| lattice::field(t, "fingerprint"))
+        .unwrap_or_default();
+    let recs = peer_records(&lat.px);
+    out.push_str(&format!(
+        "{} {} (this node) — {} — {}\n",
+        if recs.is_empty() { "\\--" } else { "+--" },
+        node,
+        fp,
+        self_serve_url(lat, domain)
+    ));
+    let n = recs.len();
+    for (i, (_, addr, text)) in recs.iter().enumerate() {
+        let mark = if i + 1 == n { "\\--" } else { "+--" };
+        let status = lattice::field(text, "status").unwrap_or_default();
+        let mut line = format!(
+            "{} {} — {} — {}",
+            mark,
+            peer_display_name(text),
+            status,
+            fmt_coord(addr)
+        );
+        if let Some(ep) = peer_display_endpoint_d(text, domain) {
+            line.push_str(&format!(" — {}", ep));
+        }
+        if status == "discovered" {
+            if let Some(via) = lattice::field(text, "via") {
+                line.push_str(&format!(" (via {})", via));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if recs.is_empty() {
+        out.push_str("(no peers yet — qexo register <pubkey> adds one)\n");
+    }
+    out
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn list(json: bool) -> i32 {
     let lat = match require_born() {
         Ok(l) => l,
         Err(c) => return c,
     };
-    print!("{}", peers_text(&lat));
+    if json {
+        // The flat machine shape: one object per peer, fields as
+        // recorded (the endpoint here is the recorded one —
+        // machines dial what the operator registered; the
+        // by-name substitution is a human display).
+        let mut items = Vec::new();
+        for (_, addr, text) in peer_records(&lat.px) {
+            let t = text.as_str();
+            items.push(format!(
+                "{{\"name\":\"{}\",\"host\":\"{}\",\"fingerprint\":\"{}\",\"status\":\"{}\",\"coord\":\"{}\",\"endpoint\":\"{}\"}}",
+                json_escape(&lattice::field(t, "name").unwrap_or_default()),
+                json_escape(&lattice::field(t, "host").unwrap_or_default()),
+                json_escape(&lattice::field(t, "fingerprint").unwrap_or_default()),
+                json_escape(&lattice::field(t, "status").unwrap_or_default()),
+                fmt_coord(&addr),
+                json_escape(&lattice::field(t, "endpoint").unwrap_or_default())
+            ));
+        }
+        println!("[{}]", items.join(","));
+    } else {
+        print!("{}", peers_tree(&lat, tailnet_domain().as_deref()));
+    }
     0
 }
 
@@ -1359,7 +1756,7 @@ pub fn message(persona: &str, text: &str) -> i32 {
 
 pub fn status() -> i32 {
     let path = lattice::state_path();
-    println!("qexo v1.3.0 — node status");
+    println!("qexo v1.4.0 — node status");
     println!("state: {}", path.display());
     let lat = match Lattice::load() {
         Ok(Some(l)) => l,
@@ -1396,7 +1793,7 @@ pub fn status() -> i32 {
                 " ({})",
                 peers
                     .iter()
-                    .map(|(_, _, t)| lattice::field(t, "name").unwrap_or_default())
+                    .map(|(_, _, t)| peer_display_name(t))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -1985,8 +2382,8 @@ fn assess_offer(claimed_signer: &str, verified: Result<&str, &str>, trusted: &st
     if fp != trusted {
         return Assess::Refuse(format!(
             "manifest claims signer {} but its signature verifies under {}",
-            lattice::fp_short(claimed_signer),
-            lattice::fp_short(fp)
+            claimed_signer,
+            fp
         ));
     }
     match (parse_version(offered), parse_version(current)) {
@@ -2224,36 +2621,40 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
     let mut current_offer: Option<String> = None;
 
     for (_, _, text) in &peers {
-        let name = lattice::field(text, "name").unwrap_or_default();
+        // Human output names the peer and shows its endpoint by
+        // name where a name exists; the recorded endpoint below
+        // is what is actually dialed, untouched by display.
+        let dname = peer_display_name(text);
         let endpoint = match lattice::field(text, "endpoint").filter(|s| !s.is_empty()) {
             Some(e) => e.trim_end_matches('/').to_string(),
             None => {
                 if loud {
                     println!(
                         "peer {}: no endpoint recorded — not pollable (re-register with --endpoint <url> to add one)",
-                        name
+                        dname
                     );
                 }
                 continue;
             }
         };
+        let shown = peer_display_endpoint(text).unwrap_or_else(|| endpoint.clone());
         let manifest_bytes = match http_get(&format!("{}/v1/release", endpoint)) {
             Ok((200, b)) => b,
             Ok((404, _)) => {
                 if loud {
-                    println!("peer {} ({}): no release announced", name, endpoint);
+                    println!("peer {} ({}): no release announced", dname, shown);
                 }
                 continue;
             }
             Ok((s, _)) => {
                 if loud {
-                    println!("peer {} ({}): /v1/release answered HTTP {} — skipped", name, endpoint, s);
+                    println!("peer {} ({}): /v1/release answered HTTP {} — skipped", dname, shown, s);
                 }
                 continue;
             }
             Err(e) => {
                 if loud {
-                    println!("peer {} ({}): unreachable — {}", name, endpoint, e);
+                    println!("peer {} ({}): unreachable — {}", dname, shown, e);
                 }
                 continue;
             }
@@ -2264,7 +2665,7 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
             Ok(m) => m,
             Err(e) => {
                 if loud {
-                    println!("peer {} ({}): unusable manifest — {} — skipped", name, endpoint, e);
+                    println!("peer {} ({}): unusable manifest — {} — skipped", dname, shown, e);
                 }
                 continue;
             }
@@ -2276,10 +2677,10 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
             if loud {
                 println!(
                     "peer {} offers qexo {} signed by {} — not this node's release signer ({}); ignored",
-                    name,
+                    dname,
                     manifest.version,
-                    lattice::fp_short(&manifest.signer),
-                    lattice::fp_short(&trusted)
+                    manifest.signer,
+                    trusted
                 );
             }
             continue;
@@ -2298,7 +2699,7 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
                     );
                 }
                 if loud {
-                    eprintln!("qexo update: release from {} claims the trusted signer but {}", endpoint, why);
+                    eprintln!("qexo update: release from {} claims the trusted signer but {}", shown, why);
                 }
                 return Ok(UpdateOutcome::Refused(why));
             }
@@ -2312,7 +2713,7 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
                     );
                 }
                 if loud {
-                    eprintln!("qexo update: release from {} claims the trusted signer but {}", endpoint, why);
+                    eprintln!("qexo update: release from {} claims the trusted signer but {}", shown, why);
                 }
                 return Ok(UpdateOutcome::Refused(why));
             }
@@ -2338,7 +2739,7 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
                 if loud {
                     eprintln!(
                         "qexo update: REFUSED — the release offered by {} claims signer {} but {} — nothing was downloaded and the running binary is untouched",
-                        endpoint, lattice::fp_short(&trusted), why
+                        shown, trusted, why
                     );
                 }
                 return Ok(UpdateOutcome::Refused(why));
@@ -2351,7 +2752,7 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
                     if mode == UpdateMode::Check {
                         println!(
                             "update available: {} → {} (signer {}, via {}) — run `qexo update` to apply",
-                            current, manifest.version, lattice::fp_short(&trusted), endpoint
+                            current, manifest.version, trusted, shown
                         );
                     }
                     return Ok(UpdateOutcome::Available {
@@ -2482,17 +2883,26 @@ fn apply_update(lat: &mut Lattice, endpoint: &str, manifest: &Manifest, trusted:
         );
     }
     // Post-check: the new binary must speak its own version and
-    // pass doctor against this node's state. Anything less and
-    // qexo.prev comes back — a bad update never stands.
+    // pass doctor against this node's state — repairing what
+    // its doctor labels fixable (v1.4.1), rolling back on
+    // anything hard. A bad update never stands.
     let post = post_update_check(&exe, &manifest.version);
+    // The new binary's repair pass may have rewritten the state
+    // file while this process held its pre-update copy in
+    // memory. Reload before writing any receipt, or the
+    // receipt's save would clobber the repairs with the stale
+    // document.
+    if let Ok(Some(fresh)) = Lattice::load_from(lat.path()) {
+        *lat = fresh;
+    }
     match post {
-        Ok(()) => {
+        PostCheck::Pass => {
             update_receipt(
                 lat,
                 "applied",
                 &[("from", current), ("to", &manifest.version), ("sha256", &manifest.sha256), ("signer", trusted)],
             );
-            println!("updated: qexo {} → {} (signer {})", current, manifest.version, lattice::fp_short(trusted));
+            println!("updated: qexo {} → {} (signer {})", current, manifest.version, trusted);
             println!("sha256 verified: {}", manifest.sha256);
             println!("previous binary kept at {}", prev.display());
             (
@@ -2500,7 +2910,23 @@ fn apply_update(lat: &mut Lattice, endpoint: &str, manifest: &Manifest, trusted:
                 UpdateOutcome::Applied { from: current.to_string(), to: manifest.version.clone() },
             )
         }
-        Err(why) => {
+        PostCheck::Repaired(repairs) => {
+            let mut extra: Vec<(&str, &str)> =
+                vec![("from", current), ("to", &manifest.version), ("sha256", &manifest.sha256), ("signer", trusted)];
+            for r in &repairs {
+                extra.push(("repair", r));
+            }
+            update_receipt(lat, "applied", &extra);
+            println!("updated: qexo {} → {} (signer {})", current, manifest.version, trusted);
+            println!("sha256 verified: {}", manifest.sha256);
+            println!("post-check repairs by the new binary (doctor --fix): {}", repairs.join("; "));
+            println!("previous binary kept at {}", prev.display());
+            (
+                0,
+                UpdateOutcome::Applied { from: current.to_string(), to: manifest.version.clone() },
+            )
+        }
+        PostCheck::Fail(why) => {
             let _ = std::fs::remove_file(&exe);
             let restored = std::fs::rename(&prev, &exe).is_ok();
             update_receipt(
@@ -2556,6 +2982,10 @@ struct ReportedPeer {
     name: String,
     fingerprint: Option<String>,
     endpoint: Option<String>,
+    /// The reported record's host: field, when it carries one —
+    /// carried into a discovered record so the new knowledge is
+    /// displayable by name from the moment it lands.
+    host: Option<String>,
 }
 
 /// What gossip makes of one reported peer.
@@ -2601,8 +3031,8 @@ fn gossip_verdict(
                     "gossip via {}: {} reported with fingerprint {} — this node's trusted record says {} — report not adopted, record untouched",
                     via,
                     rep.name,
-                    lattice::fp_short(&rep_fp),
-                    lattice::fp_short(tfp)
+                    rep_fp,
+                    tfp
                 ))
             };
         }
@@ -2610,7 +3040,7 @@ fn gossip_verdict(
             return GossipVerdict::Conflict(format!(
                 "gossip via {}: fingerprint {} reported under the name {} — this node trusts that fingerprint as {} — report not adopted, record untouched",
                 via,
-                lattice::fp_short(&rep_fp),
+                rep_fp,
                 rep.name,
                 tname
             ));
@@ -2625,8 +3055,8 @@ fn gossip_verdict(
                     "gossip via {}: {} reported with fingerprint {} — the discovered record on file says {} ({}) — report not adopted, record untouched",
                     via,
                     rep.name,
-                    lattice::fp_short(&rep_fp),
-                    lattice::fp_short(dfp),
+                    rep_fp,
+                    dfp,
                     dname
                 ))
             };
@@ -2678,12 +3108,19 @@ fn gossip_stage(px: &mut Phext, report: &mut EvolveReport) {
             Ok((s, _)) => {
                 report.warnings.push(format!(
                     "gossip: peer {} ({}) answered its peers index with HTTP {} — skipped",
-                    pname, endpoint, s
+                    pname,
+                    display_endpoint_for(pname, endpoint),
+                    s
                 ));
                 continue;
             }
             Err(e) => {
-                report.warnings.push(format!("gossip: peer {} ({}) unreachable — {}", pname, endpoint, e));
+                report.warnings.push(format!(
+                    "gossip: peer {} ({}) unreachable — {}",
+                    pname,
+                    display_endpoint_for(pname, endpoint),
+                    e
+                ));
                 continue;
             }
         };
@@ -2713,6 +3150,7 @@ fn gossip_stage(px: &mut Phext, report: &mut EvolveReport) {
                         name: lattice::field(&t, "name").unwrap_or(rname),
                         fingerprint: lattice::field(&t, "fingerprint").filter(|s| !s.is_empty()),
                         endpoint: lattice::field(&t, "endpoint").filter(|s| !s.is_empty()),
+                        host: lattice::field(&t, "host").filter(|s| !s.is_empty()),
                     });
                 }
                 Ok((s, _)) => report.warnings.push(format!(
@@ -2749,6 +3187,9 @@ fn gossip_stage(px: &mut Phext, report: &mut EvolveReport) {
                         ("via", pname),
                         ("discovered", &stamp),
                     ];
+                    if let Some(h) = &rep.host {
+                        fields.push(("host", h));
+                    }
                     if let Some(ep) = &rep.endpoint {
                         fields.push(("endpoint", ep));
                     }
@@ -3098,25 +3539,81 @@ pub fn evolve(check_only: bool) -> i32 {
     if report.binary_bad { 1 } else { 0 }
 }
 
-/// Post-swap check: `--version` must name the new version and
-/// `doctor` must pass against this node's (inherited) state.
-fn post_update_check(exe: &Path, version: &str) -> Result<(), String> {
-    let out = std::process::Command::new(exe)
-        .arg("--version")
+/// The post-swap verdict (v1.4.1): the update stands clean,
+/// the update stands WITH REPAIRS the new binary made to the
+/// inherited state, or the update falls.
+enum PostCheck {
+    Pass,
+    Repaired(Vec<String>),
+    Fail(String),
+}
+
+fn run_new_binary(exe: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    std::process::Command::new(exe)
+        .args(args)
         .output()
-        .map_err(|e| format!("cannot run the new binary: {}", e))?;
+        .map_err(|e| format!("cannot run the new binary ({}): {}", args.join(" "), e))
+}
+
+/// Post-swap check: `--version` must name the new version and
+/// `doctor` must pass against this node's (inherited) state —
+/// with the v1.4.1 repair distinction. The v1.4.0 fleet
+/// refusal is the lesson: the post-check ran doctor in check
+/// mode, a state born under 1.3.0 failed on a missing homeland
+/// index doctor itself marks FIXABLE, and the rollback removed
+/// the only binary that could run the fix. So when the check
+/// fails, the new binary's own `doctor --fix` runs — it
+/// repairs only what doctor labels fixable (filesystem facts,
+/// the derived indexes), by the new binary's hand, since the
+/// new binary is the one that knows the new layout — and the
+/// check runs again. Clean after repair: the update stands,
+/// the repairs named. Still failing: the remaining problems
+/// are hard by construction (an unparseable state, a missing
+/// keyring — anything doctor does NOT label fixable) and
+/// qexo.prev comes back, exactly as before. The classification
+/// is deliberately conservative: it inherits doctor's own
+/// fixable labels rather than judging findings itself.
+fn post_update_check(exe: &Path, version: &str) -> PostCheck {
+    let out = match run_new_binary(exe, &["--version"]) {
+        Ok(o) => o,
+        Err(e) => return PostCheck::Fail(e),
+    };
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() || !text.contains(&format!("v{}", version)) {
-        return Err(format!("version stamp reads {:?}, expected qexo v{}", text.trim(), version));
+        return PostCheck::Fail(format!("version stamp reads {:?}, expected qexo v{}", text.trim(), version));
     }
-    let doc = std::process::Command::new(exe)
-        .arg("doctor")
-        .output()
-        .map_err(|e| format!("cannot run the new binary's doctor: {}", e))?;
-    if !doc.status.success() {
-        return Err("the new binary's doctor reports problems against this node's state".to_string());
+    let doctor_ok = |exe: &Path| -> Result<bool, String> {
+        run_new_binary(exe, &["doctor"]).map(|o| o.status.success())
+    };
+    match doctor_ok(exe) {
+        Ok(true) => PostCheck::Pass,
+        Ok(false) => {
+            let fix = match run_new_binary(exe, &["doctor", "--fix"]) {
+                Ok(o) => o,
+                Err(e) => return PostCheck::Fail(e),
+            };
+            let fix_text = String::from_utf8_lossy(&fix.stdout).to_string();
+            let mut repairs: Vec<String> = fix_text
+                .lines()
+                .filter_map(|l| l.strip_prefix("fixed: ").map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            match doctor_ok(exe) {
+                Ok(true) => {
+                    if repairs.is_empty() {
+                        repairs.push("doctor --fix repair pass".to_string());
+                    }
+                    PostCheck::Repaired(repairs)
+                }
+                Ok(false) => PostCheck::Fail(
+                    "the new binary's doctor reports problems against this node's state — still failing after its repair pass (the remaining problems are not doctor-fixable)"
+                        .to_string(),
+                ),
+                Err(e) => PostCheck::Fail(e),
+            }
+        }
+        Err(e) => PostCheck::Fail(e),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3221,7 +3718,7 @@ mod tests {
     // ---- v1.2.0: evolve — gossip trust, persona lineage ----
 
     fn rep(name: &str, fp: &str) -> ReportedPeer {
-        ReportedPeer { name: name.to_string(), fingerprint: Some(fp.to_string()), endpoint: None }
+        ReportedPeer { name: name.to_string(), fingerprint: Some(fp.to_string()), endpoint: None, host: None }
     }
 
     #[test]
@@ -3441,6 +3938,175 @@ mod tests {
         }
         let bin = fields.iter().find(|(k, _)| k == "binary").map(|(_, v)| v.as_str());
         assert_eq!(bin, Some("updated 1.1.0 → 1.2.0"));
+    }
+
+    // ---- v1.4.0: hostnames, display, the nav tree ----
+
+    #[test]
+    fn host_comes_out_of_the_key_uid() {
+        assert_eq!(host_from_uid("qexo node aletheia-core (qexo node key)"), Some("aletheia-core".to_string()));
+        assert_eq!(host_from_uid("qexo node rock-mountain"), Some("rock-mountain".to_string()));
+        assert_eq!(host_from_uid("someone (a comment)"), Some("someone".to_string()));
+        assert_eq!(host_from_uid("  "), None);
+        assert_eq!(host_from_uid("qexo node "), None);
+    }
+
+    fn peer_rec(fields: &[(&str, &str)]) -> String {
+        lattice::record(fields)
+    }
+
+    #[test]
+    fn display_name_prefers_host_then_falls_back_to_name() {
+        let with = peer_rec(&[("name", "peer-a4e7277f"), ("host", "aletheia-core")]);
+        assert_eq!(peer_display_name(&with), "aletheia-core");
+        // a record that predates host: shows its name — for the
+        // fleet those names ARE the tailnet hostnames already
+        let legacy = peer_rec(&[("name", "rock-mountain")]);
+        assert_eq!(peer_display_name(&legacy), "rock-mountain");
+        let empty_host = peer_rec(&[("name", "peer-a4e7277f"), ("host", "")]);
+        assert_eq!(peer_display_name(&empty_host), "peer-a4e7277f");
+    }
+
+    #[test]
+    fn display_endpoint_substitutes_the_name_for_a_bare_ip() {
+        let dom = Some("pizzly-halfmoon.ts.net");
+        let t = peer_rec(&[("name", "peer-a4e7277f"), ("host", "aletheia-core"), ("endpoint", "http://100.88.154.1:8484")]);
+        // v1.4.1: the substituted name goes out in its fully-
+        // qualified tailnet form — the only form the diagnosis
+        // found resolving to where serve listens
+        assert_eq!(peer_display_endpoint_d(&t, dom).as_deref(), Some("http://aletheia-core.pizzly-halfmoon.ts.net:8484"));
+        // with no domain discoverable, the bare name is the fallback
+        assert_eq!(peer_display_endpoint_d(&t, None).as_deref(), Some("http://aletheia-core:8484"));
+        // a hostname endpoint stands as recorded
+        let t = peer_rec(&[("name", "rock-mountain"), ("endpoint", "http://rock-mountain:8484")]);
+        assert_eq!(peer_display_endpoint_d(&t, dom).as_deref(), Some("http://rock-mountain:8484"));
+        // a dotted host: stands as it is (already qualified)
+        let t = peer_rec(&[("name", "peer-x"), ("host", "rock-mountain.pizzly-halfmoon.ts.net"), ("endpoint", "http://100.69.163.95:8484")]);
+        assert_eq!(peer_display_endpoint_d(&t, dom).as_deref(), Some("http://rock-mountain.pizzly-halfmoon.ts.net:8484"));
+        // THE FLEET SHAPE: a synthetic peer-<fp8> name and no
+        // host: — no name may be dressed up as a URL host; the
+        // recorded endpoint stands, because the IP connects
+        let t = peer_rec(&[("name", "peer-768b2a06"), ("fingerprint", &"0123456789ABCDEF0123456789ABCDEF768B2A06".to_string()), ("endpoint", "http://100.102.119.123:8484")]);
+        assert_eq!(peer_display_endpoint_d(&t, dom).as_deref(), Some("http://100.102.119.123:8484"));
+        // a REAL record name (not the synthetic derivative of
+        // its own fingerprint) is a hostname and is used
+        let t = peer_rec(&[("name", "rock-mountain"), ("fingerprint", &"B".repeat(40)), ("endpoint", "http://100.69.163.95:8484")]);
+        assert_eq!(peer_display_endpoint_d(&t, dom).as_deref(), Some("http://rock-mountain.pizzly-halfmoon.ts.net:8484"));
+        // no endpoint, no display endpoint
+        let t = peer_rec(&[("name", "rock-mountain")]);
+        assert_eq!(peer_display_endpoint_d(&t, dom), None);
+    }
+
+    #[test]
+    fn recorded_endpoint_prefers_the_tailnet_dns_form() {
+        let dom = Some("pizzly-halfmoon.ts.net");
+        // tailnet IP + known hostname + known domain: DNS form
+        assert_eq!(
+            recorded_endpoint("rock-mountain", "http://100.69.163.95:8484", dom),
+            "http://rock-mountain.pizzly-halfmoon.ts.net:8484"
+        );
+        // no domain discoverable: recorded exactly as given
+        assert_eq!(recorded_endpoint("rock-mountain", "http://100.69.163.95:8484", None), "http://100.69.163.95:8484");
+        // a LAN address is not the tailnet's business
+        assert_eq!(recorded_endpoint("rock-mountain", "http://192.168.86.31:8484", dom), "http://192.168.86.31:8484");
+        // a hostname endpoint stands as given
+        assert_eq!(recorded_endpoint("rock-mountain", "http://rock-mountain:8484", dom), "http://rock-mountain:8484");
+        // an already-qualified hostname is not doubled
+        assert_eq!(
+            recorded_endpoint("rock-mountain.pizzly-halfmoon.ts.net", "http://100.69.163.95:8484", dom),
+            "http://rock-mountain.pizzly-halfmoon.ts.net:8484"
+        );
+    }
+
+    #[test]
+    fn tailnet_domain_comes_out_of_resolv_conf() {
+        let fleet = "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch lan pizzly-halfmoon.ts.net\n";
+        assert_eq!(tailnet_domain_in(fleet).as_deref(), Some("pizzly-halfmoon.ts.net"));
+        assert_eq!(tailnet_domain_in("search ts.net.example.org other.ts.net\n").as_deref(), Some("other.ts.net"));
+        assert_eq!(tailnet_domain_in("search lan home\n"), None);
+        assert_eq!(tailnet_domain_in("nameserver 1.1.1.1\n"), None);
+        assert_eq!(tailnet_domain_in("domain pizzly-halfmoon.ts.net\n").as_deref(), Some("pizzly-halfmoon.ts.net"));
+    }
+
+    #[test]
+    fn nav_tree_renders_the_net_by_name_with_a_discovered_peer() {
+        let mut px = Phext::new();
+        px.insert(
+            lattice::IDENTITY,
+            lattice::record(&[("kind", "node identity"), ("name", "qexo node testbox"), ("node", "testbox")]),
+        );
+        px.insert(
+            lattice::NODE_KEY_RECORD,
+            lattice::record(&[("kind", "node key"), ("fingerprint", &"A".repeat(40)), ("status", "active")]),
+        );
+        px.insert(
+            lattice::at(lattice::HL_PEERS, [2, 1, 1, 1, 1, 1]),
+            lattice::record(&[
+                ("kind", "peer"),
+                ("name", "peer-a4e7277f"),
+                ("host", "aletheia-core"),
+                ("fingerprint", &"B".repeat(40)),
+                ("status", "registered"),
+                ("endpoint", "http://100.88.154.1:8484"),
+            ]),
+        );
+        px.insert(
+            lattice::at(lattice::HL_PEERS, [3, 1, 1, 1, 1, 1]),
+            lattice::record(&[
+                ("kind", "peer"),
+                ("name", "peer-8cf39bf8"),
+                ("fingerprint", &"C".repeat(40)),
+                ("status", "discovered"),
+                ("via", "aletheia-core"),
+            ]),
+        );
+        let mut lat = Lattice::born(std::path::PathBuf::from("/tmp/qexo-tree-test/state.phext"));
+        lat.px = px;
+        let tree = peers_tree(&lat, Some("pizzly-halfmoon.ts.net"));
+        // the snapshot, byte for byte: root anchor, this node
+        // marked — fingerprint IN FULL (v1.4.1: public keys are
+        // never shortened) and its own serve URL (loopback: the
+        // test state carries no serve_bind, and the default is
+        // loopback) — peers nested under their record addresses,
+        // the endpoint in its fully-qualified tailnet form, the
+        // discovered peer with its via
+        let expected = format!(
+            "3.3.3/3.3.3/3.3.3 — peers\n\
+             +-- testbox (this node) — {} — http://127.0.0.1:8484\n\
+             +-- aletheia-core — registered — 3.3.3/2.1.1/1.1.1 — http://aletheia-core.pizzly-halfmoon.ts.net:8484\n\
+             \\-- peer-8cf39bf8 — discovered — 3.3.3/3.1.1/1.1.1 (via aletheia-core)\n",
+            "A".repeat(40)
+        );
+        assert_eq!(tree, expected, "\n{}", tree);
+        // no peer tailnet IP anywhere in the human rendering,
+        // and no ellipsized fingerprint pattern
+        assert!(!tree.contains("100.88.154.1"), "{}", tree);
+        assert!(!tree.contains('…'), "{}", tree);
+    }
+
+    #[test]
+    fn nav_tree_self_url_uses_the_tailnet_form_when_serve_binds_it() {
+        let mut px = Phext::new();
+        px.insert(
+            lattice::IDENTITY,
+            lattice::record(&[("kind", "node identity"), ("node", "aletheia-core")]),
+        );
+        px.insert(
+            lattice::NODE_KEY_RECORD,
+            lattice::record(&[("kind", "node key"), ("fingerprint", &"A".repeat(40)), ("status", "active")]),
+        );
+        px.insert(
+            lattice::CONFIG_RECORD,
+            lattice::record(&[("kind", "qexo config"), ("serve_bind", "100.88.154.1")]),
+        );
+        let mut lat = Lattice::born(std::path::PathBuf::from("/tmp/qexo-tree-test/state.phext"));
+        lat.px = px;
+        let tree = peers_tree(&lat, Some("pizzly-halfmoon.ts.net"));
+        assert!(
+            tree.contains("aletheia-core (this node) — AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA — http://aletheia-core.pizzly-halfmoon.ts.net:8484"),
+            "{}",
+            tree
+        );
     }
 }
 

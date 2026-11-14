@@ -11,7 +11,9 @@
 //!   keys & trust, 3.3.3/3.3.3/3.3.3 peers, 4.4.4/4.4.4/4.4.4
 //!   personas, 5.5.5/5.5.5/5.5.5 plan, 6.6.6/6.6.6/6.6.6 ledgers,
 //!   7.7.7/7.7.7/7.7.7 mailbox & sessions, 8.8.8/8.8.8/8.8.8
-//!   telemetry, 9.9.9/9.9.9/9.9.9 config & wiring. Records live
+//!   telemetry, 9.9.9/9.9.9/9.9.9 config & wiring, and — added in
+//!   v1.4.0, the tens — 10.10.10/10.10.10/10.10.10 lessons &
+//!   learning (the `qexo learn` curriculum deck). Records live
 //!   at full 9D addresses in the anchor's vicinity. No
 //!   hash-derived coordinates, no counters-as-addresses, no
 //!   arithmetic sequence splits.
@@ -29,6 +31,19 @@
 //!   the index scrolls — finding is navigation plus the index.
 //! - Revisions edit scrolls in place; git carries history.
 //!   Retirement is a `status:` line in the record.
+//! - A state is topped up on write (v1.4.1): `save` seeds any
+//!   index scroll the current layout defines that the document
+//!   lacks — a state born under an older binary becomes whole
+//!   under the new layout on its first write, and nothing it
+//!   already carries is ever touched by the seeding.
+//! - Which file IS the state is resolved intent-aware
+//!   (v1.4.1): a write-intending verb in unprivileged hands
+//!   never adopts a system state it cannot write; it selects
+//!   the per-user state instead. Read-only verbs keep the
+//!   v1.4.0 order unchanged. And `qexo learn` prefers an
+//!   existing per-user deck (v1.4.2) — the deck is the
+//!   operator's own. The full order is stated at
+//!   `pick_state_path`.
 //!
 //! The state's substance: every scrap of node state — metadata,
 //! keys, grants, personas, plan, ledgers, sessions — is scrolls
@@ -52,6 +67,15 @@ pub const HL_LEDGERS: [u32; 3] = [6, 6, 6];
 pub const HL_MAIL: [u32; 3] = [7, 7, 7];
 pub const HL_TELEMETRY: [u32; 3] = [8, 8, 8];
 pub const HL_CONFIG: [u32; 3] = [9, 9, 9];
+/// Lessons & learning (v1.4.0): the tens — practice, repeated.
+/// The anchor pattern extends by one: where the nine ones-to-nines
+/// homelands were the node's records of the world, the tens are
+/// the node's record of its operator's practice.
+pub const HL_LEARN: [u32; 3] = [10, 10, 10];
+
+/// The curriculum deck's cluster inside the learn homeland: one
+/// Book per card, grown by adjacency (Layer 2 growth rule).
+pub const LEARN_DECK_C: u32 = 2;
 
 /// The home scroll: prose index of the whole state file.
 pub const HOME: Coord = [1, 1, 1, 1, 1, 1, 1, 1, 1];
@@ -251,14 +275,10 @@ pub fn record(fields: &[(&str, &str)]) -> String {
     s
 }
 
-/// One-line shortening of a fingerprint for prose.
-pub fn fp_short(fp: &str) -> String {
-    if fp.len() > 16 {
-        format!("{}…{}", &fp[..8], &fp[fp.len() - 8..])
-    } else {
-        fp.to_string()
-    }
-}
+/// (v1.4.1: the fp_short helper is gone. Will's ruling from the
+/// v1.4.0 field test — "public keys shouldn't be shortened" —
+/// fingerprints print in full, all 40 hex characters, everywhere
+/// a human reads them. Callers use the fingerprint itself.)
 
 // ----------------------------------------------------------------
 // Record enumeration (truth lives in the records; doctor and the
@@ -363,7 +383,7 @@ pub fn regen_indexes(px: &mut Phext) {
                     label,
                     crate::phext::fmt_coord(&addr),
                     field(t, "name").or_else(|| field(t, "persona")).or_else(|| field(t, "peer")).unwrap_or_default(),
-                    field(t, "fingerprint").map(|f| format!("fingerprint {}", fp_short(&f))).unwrap_or_default()
+                    field(t, "fingerprint").map(|f| format!("fingerprint {}", f)).unwrap_or_default()
                 ));
             }
         }
@@ -483,6 +503,24 @@ pub fn regen_indexes(px: &mut Phext) {
     }
     px.insert(index_addr(HL_CONFIG), cfg);
 
+    // ---- lessons & learning index ----
+    let card_books = component_values(px, &[10, 10, 10, LEARN_DECK_C, 1], 5);
+    let mut lrn = String::new();
+    lrn.push_str("lessons & learning — homeland anchor 10.10.10/10.10.10/10.10.10\n\n");
+    lrn.push_str("The tens: practice, repeated. The curriculum deck lives\nin the run beside this index — one scroll per card, front\nand back as field lines, the scheduling fields (due,\ninterval_days, ease, reps, lapses) updated in place by\n`qexo learn` as the operator practices.\n\n");
+    lrn.push_str(&format!("cards: {}\n", card_books.len()));
+    for b in &card_books {
+        let addr = at(HL_LEARN, [LEARN_DECK_C, 1, *b, 1, 1, 1]);
+        if let Some(t) = px.get(&addr) {
+            lrn.push_str(&format!(
+                "- {} — {}\n",
+                field(t, "id").unwrap_or_default(),
+                crate::phext::fmt_coord(&addr)
+            ));
+        }
+    }
+    px.insert(index_addr(HL_LEARN), lrn);
+
     // ---- home index (written last: it summarizes the rest) ----
     let id = px.get(&IDENTITY);
     let (node_line, born_line) = match id {
@@ -510,7 +548,6 @@ pub fn regen_indexes(px: &mut Phext) {
         crate::phext::fmt_coord(&index_addr(HL_KEYS)),
         px.get(&NODE_KEY_RECORD)
             .and_then(|t| field(t, "fingerprint"))
-            .map(|f| fp_short(&f))
             .unwrap_or_else(|| "none".into()),
         count_cluster_books(px, [2, 2, 2, KEYS_PERSONA_C, 1])
             + count_cluster_books(px, [2, 2, 2, KEYS_PEER_C, 1])
@@ -559,79 +596,303 @@ pub fn regen_indexes(px: &mut Phext) {
         "{} — config & wiring: the machine room\n",
         crate::phext::fmt_coord(&index_addr(HL_CONFIG))
     ));
+    home.push_str(&format!(
+        "{} — lessons & learning: {} card(s) in the deck\n",
+        crate::phext::fmt_coord(&index_addr(HL_LEARN)),
+        card_books.len()
+    ));
     px.insert(HOME, home);
 }
 
-// ----------------------------------------------------------------
-// The state file itself
-// ----------------------------------------------------------------
-
-/// The canonical state path: /var/lib/qexo/state.phext.
-/// QEXO_STATE overrides it for development and tests only.
-pub fn state_path() -> PathBuf {
-    match std::env::var("QEXO_STATE") {
-        Ok(p) if !p.is_empty() => PathBuf::from(p),
-        _ => default_state_path(),
+/// Every index scroll the current Layer 2 layout defines: the
+/// home index plus each homeland's anchor scroll, the tens
+/// included. This is the whole set a state must carry to be
+/// whole under the running binary's layout.
+pub fn index_addresses() -> Vec<Coord> {
+    let mut out = vec![HOME];
+    for h in [HL_KEYS, HL_PEERS, HL_PERSONAS, HL_PLAN, HL_LEDGERS, HL_MAIL, HL_TELEMETRY, HL_CONFIG, HL_LEARN] {
+        out.push(index_addr(h));
     }
+    out
 }
 
-#[cfg(not(target_os = "android"))]
-fn default_state_path() -> PathBuf {
+/// The state top-up (v1.4.1): seed any index scroll the current
+/// layout defines that this document lacks, with exactly the
+/// text `regen_indexes` would give it. Born of the v1.4.0 fleet
+/// refusal: states born under 1.3.0 carry no lessons homeland,
+/// so the new layout's index is missing through no damage of
+/// theirs — an upgraded state becomes whole by the running
+/// binary's own hand the first time it writes. Surgical by
+/// construction: an index that EXISTS is never touched (records
+/// and indexes alike), a missing one is copied from a scratch
+/// regeneration of this same document. Idempotent — a whole
+/// state seeds nothing. Returns the addresses seeded.
+pub fn seed_missing_indexes(px: &mut Phext) -> Vec<Coord> {
+    let missing: Vec<Coord> = index_addresses().into_iter().filter(|a| px.get(a).is_none()).collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let mut scratch = px.clone();
+    regen_indexes(&mut scratch);
+    let mut seeded = Vec::new();
+    for a in missing {
+        if let Some(t) = scratch.get(&a) {
+            px.insert(a, t.clone());
+            seeded.push(a);
+        }
+    }
+    seeded
+}
+
+/// The system state path: /var/lib/qexo/state.phext — canonical
+/// for system installs (root-run services, the ranch fleet).
+pub fn system_state_path() -> PathBuf {
     PathBuf::from("/var/lib/qexo/state.phext")
 }
 
-/// Android (Termux): /var/lib/qexo is not writable there, so when
-/// the canonical directory cannot be created the node lives under
-/// $HOME/.qexo instead — and says so (config prints the fallback
-/// note at birth; see state_path_is_fallback). Resolved once per
-/// process: probing creatability twice could disagree with itself.
-#[cfg(target_os = "android")]
-fn default_state_path() -> PathBuf {
-    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    PATH.get_or_init(resolve_android_state_path).clone()
+/// The per-user state path (v1.4.0): $HOME/.qexo/state.phext —
+/// on Windows, under the user profile (%USERPROFILE%, falling
+/// back to HOME), resolved the same cfg way the codebase splits
+/// platforms elsewhere. A node installed by an unprivileged user
+/// (a plain `cargo install qexo`) lives here, whole: state file
+/// and GPG keyring side by side, no sudo anywhere in its life.
+pub fn user_state_path() -> Option<PathBuf> {
+    user_home().map(|h| h.join(".qexo").join("state.phext"))
 }
 
-#[cfg(target_os = "android")]
-fn resolve_android_state_path() -> PathBuf {
-    let canonical = PathBuf::from("/var/lib/qexo/state.phext");
-    let canonical_usable = canonical.exists()
-        || canonical
-            .parent()
-            .map(|d| std::fs::create_dir_all(d).is_ok())
-            .unwrap_or(false);
-    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty()).map(PathBuf::from);
-    pick_android_state_path(canonical_usable, home)
-}
-
-/// The Android pick, pure so the fallback logic is unit-testable on
-/// any host: canonical when it is usable; else $HOME/.qexo; else
-/// canonical anyway (the birth error will name it honestly rather
-/// than inventing a third place to live).
-#[cfg(any(target_os = "android", test))]
-fn pick_android_state_path(canonical_usable: bool, home: Option<PathBuf>) -> PathBuf {
-    if canonical_usable {
-        PathBuf::from("/var/lib/qexo/state.phext")
-    } else if let Some(h) = home {
-        h.join(".qexo").join("state.phext")
-    } else {
-        PathBuf::from("/var/lib/qexo/state.phext")
-    }
-}
-
-/// Whether the state path in use is the Android $HOME fallback
-/// (always false on other platforms, and false when QEXO_STATE
-/// named the path — an explicit choice is not a fallback).
-pub fn state_path_is_fallback() -> bool {
-    #[cfg(target_os = "android")]
+fn user_home() -> Option<PathBuf> {
+    #[cfg(windows)]
     {
-        if std::env::var("QEXO_STATE").map(|p| !p.is_empty()).unwrap_or(false) {
-            return false;
+        if let Some(p) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(p));
         }
-        state_path() != PathBuf::from("/var/lib/qexo/state.phext")
     }
-    #[cfg(not(target_os = "android"))]
-    {
-        false
+    std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// The facts the resolution order reads. Probed from the live
+/// system by `state_path`; supplied directly by tests.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StateFacts {
+    /// The system state file exists.
+    pub system_exists: bool,
+    /// The system state file can be opened for reading by this
+    /// process (only meaningful when it exists).
+    pub system_readable: bool,
+    /// The system state file can be opened for writing by this
+    /// process (only meaningful when it exists). Probed with an
+    /// append-open, which grants or refuses on the file's own
+    /// permissions without altering a byte.
+    pub system_writable: bool,
+    /// The per-user state file exists.
+    pub user_exists: bool,
+    /// This process runs privileged (effective uid 0 on Unix;
+    /// never assumed on Windows).
+    pub privileged: bool,
+    /// The running verb intends to WRITE state (v1.4.1): set by
+    /// main() from the parsed command — see `set_write_intent`.
+    pub write_intent: bool,
+    /// The running verb is `qexo learn` (v1.4.2): set by main()
+    /// — see `set_learn_preference`.
+    pub learn_pref: bool,
+}
+
+/// The process's intent, declared once by main() before any
+/// state is touched: some verbs only read the node (list,
+/// status, doctor's check pass, the --check modes), and the
+/// rest write it (config, register, learn, plan, the apply
+/// modes, doctor --fix). Resolution is intent-aware (v1.4.1)
+/// because existence-plus-readability is the wrong test for a
+/// verb that will write: it handed a standard user the
+/// fleet's root-owned state to read, and the first write —
+/// qexo learn saving a graded card — died on permissions.
+static WRITE_INTENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_write_intent() {
+    WRITE_INTENT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn write_intent() -> bool {
+    WRITE_INTENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The learn preference (v1.4.2): the deck is the operator's
+/// OWN — when a per-user state exists, `qexo learn` reads and
+/// writes it in preference to the system state, because
+/// practice is personal even on a shared machine. v1.4.1
+/// classified both learn forms as write-intending, which made
+/// `learn --status` on a machine with a readable system state
+/// but NO per-user state yet divert to the missing per-user
+/// path and error "not born" — where v1.4.0 answered from the
+/// readable deck. The preference therefore applies only when
+/// a per-user state EXISTS; with none, learn falls through to
+/// the shipped order and answers.
+static LEARN_PREF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_learn_preference() {
+    LEARN_PREF.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn learn_preference() -> bool {
+    LEARN_PREF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The resolution order (v1.4.1), stated exactly as shipped:
+///   1. QEXO_STATE, when set non-empty (the caller's word).
+///   2. THE WRITE-INTENT RULE (new in v1.4.1): a write-intending
+///      verb in unprivileged hands, facing a system state it
+///      cannot write, selects the per-user path instead —
+///      existing or to be born there by config. The system
+///      state belongs to its owner; this user's node is their
+///      own. (Read-only verbs are untouched by this rule and
+///      keep the order below exactly as v1.4.0 shipped it.)
+///   2b. THE LEARN RULE (new in v1.4.2): `qexo learn` in
+///      unprivileged hands, when a per-user state EXISTS,
+///      selects the per-user path — the deck belongs to the
+///      operator, not to the machine's owner. With no
+///      per-user state, learn falls through to the order
+///      below like any reader (v1.4.1 diverted it to the
+///      missing path and errored; v1.4.0 answered).
+///   3. The system path, when the system state exists and this
+///      process can read it — a system install stays canonical,
+///      byte-for-byte, and read-only verbs never fail on its
+///      permissions when a per-user state exists instead (rule 4
+///      is what they fall to).
+///   4. The per-user path, when a per-user state exists.
+///   5. The system path again when it exists but cannot be read
+///      and no per-user state exists — the honest error names
+///      the real file rather than inventing an empty node.
+///   6. Nothing exists: the system path for a privileged
+///      process, the per-user path otherwise (a fresh
+///      `qexo config` as a normal user births a per-user node);
+///      with no home directory to anchor to, the system path.
+/// A node has ONE state: the resolution finds the first that
+/// exists, and `qexo status` names which path is live.
+pub fn pick_state_path(facts: StateFacts, system: &std::path::Path, user: Option<&std::path::Path>) -> PathBuf {
+    if facts.write_intent && !facts.privileged && facts.system_exists && !facts.system_writable {
+        if let Some(u) = user {
+            return u.to_path_buf();
+        }
+    }
+    if facts.learn_pref && !facts.privileged && facts.user_exists {
+        if let Some(u) = user {
+            return u.to_path_buf();
+        }
+    }
+    if facts.system_exists && facts.system_readable {
+        return system.to_path_buf();
+    }
+    if facts.user_exists {
+        if let Some(u) = user {
+            return u.to_path_buf();
+        }
+    }
+    if facts.system_exists {
+        return system.to_path_buf();
+    }
+    if facts.privileged {
+        return system.to_path_buf();
+    }
+    match user {
+        Some(u) => u.to_path_buf(),
+        None => system.to_path_buf(),
+    }
+}
+
+/// Effective-uid-0 probe. Linux/Android read /proc/self/status;
+/// other Unix falls back to USER=root; Windows never assumes
+/// privilege (an elevated install names its state explicitly —
+/// QEXO_STATE or a pre-created system file, both of which the
+/// resolution honors before this probe matters).
+#[cfg(unix)]
+fn is_privileged() -> bool {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                let f: Vec<&str> = rest.split_whitespace().collect();
+                if f.len() >= 2 {
+                    return f[1] == "0";
+                }
+            }
+        }
+    }
+    std::env::var("USER").map(|u| u == "root").unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_privileged() -> bool {
+    false
+}
+
+fn probe_facts(user: &Option<PathBuf>) -> StateFacts {
+    let system = system_state_path();
+    let system_exists = system.exists();
+    StateFacts {
+        system_exists,
+        system_readable: system_exists && std::fs::File::open(&system).is_ok(),
+        // Append-open: asks the file's own permissions whether
+        // this process may write, without altering a byte and
+        // without creating anything (no create flag).
+        system_writable: system_exists
+            && std::fs::OpenOptions::new().append(true).open(&system).is_ok(),
+        user_exists: user.as_ref().map(|u| u.exists()).unwrap_or(false),
+        privileged: is_privileged(),
+        write_intent: write_intent(),
+        learn_pref: learn_preference(),
+    }
+}
+
+/// The node's state path, resolved by the order above.
+pub fn state_path() -> PathBuf {
+    match std::env::var("QEXO_STATE") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            let user = user_state_path();
+            pick_state_path(probe_facts(&user), &system_state_path(), user.as_deref())
+        }
+    }
+}
+
+/// The path a birth should use, with the fallback applied: when
+/// resolution chose the system path for a state that does not
+/// exist yet and the system directory cannot be created by this
+/// user, the birth falls back to the per-user path — returned as
+/// (path, fell_back) so the caller can say so out loud, the way
+/// the Android home fallback always has. An env-chosen path is
+/// the operator's word and is never second-guessed.
+pub fn birth_path() -> (PathBuf, bool) {
+    let p = state_path();
+    let env_chosen = std::env::var("QEXO_STATE").map(|v| !v.is_empty()).unwrap_or(false);
+    if !env_chosen && p == system_state_path() && !p.exists() {
+        let dir = p.parent().unwrap_or(std::path::Path::new("/var/lib/qexo"));
+        // Reachable means: the directory can be created AND a
+        // file can actually be written in it. (create_dir_all
+        // alone succeeds on an existing read-only directory —
+        // the parked-root-dir case — and a birth that lands
+        // there would die at its first save.)
+        let reachable = std::fs::create_dir_all(dir).is_ok() && probe_writable(dir);
+        if !reachable {
+            if let Some(u) = user_state_path() {
+                if let Some(parent) = u.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                return (u, true);
+            }
+        }
+    }
+    (p, false)
+}
+
+/// Can this process actually write a file in `dir`? Probed with
+/// a create-and-remove, the only honest test.
+fn probe_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".qexo-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -682,7 +943,18 @@ impl Lattice {
     /// Persist the whole document. Phext serializes canonically
     /// (ascending coordinates, delimiter ladder), so a save is a
     /// rewrite of one file — the format's write model, accepted.
-    pub fn save(&self) -> Result<(), String> {
+    ///
+    /// Every save first runs the state top-up (v1.4.1):
+    /// `seed_missing_indexes` makes the document whole under
+    /// the running binary's Layer 2 layout before it is written.
+    /// save() is the write boundary — every mutating verb ends
+    /// here, and no read or --check path ever reaches it (their
+    /// byte-inert guarantees are untouched) — so an inherited
+    /// state gains the homelands its birth binary predates on
+    /// the first write the new binary makes, whichever verb
+    /// that write belongs to.
+    pub fn save(&mut self) -> Result<(), String> {
+        seed_missing_indexes(&mut self.px);
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("{}: {}", parent.display(), e))?;
@@ -703,7 +975,7 @@ mod tests {
         let mut px = Phext::new();
         px.insert(HOME, "home".to_string());
         px.insert(IDENTITY, "second".to_string());
-        let lat = Lattice { px, path: path.clone() };
+        let mut lat = Lattice { px, path: path.clone() };
         lat.save().unwrap();
         let back = Lattice::load_from(&path).unwrap().expect("state exists");
         assert_eq!(back.px.scrolls, lat.px.scrolls);
@@ -766,26 +1038,160 @@ mod tests {
         assert_eq!(px.serialize(), before);
     }
 
+    // ---- state resolution (v1.4.0) ----
+
+    fn facts(se: bool, sr: bool, ue: bool, priv_: bool) -> StateFacts {
+        // read intent (v1.4.0's rows): writability is not probed
+        // into the decision, so its value here is inert.
+        StateFacts { system_exists: se, system_readable: sr, system_writable: true, user_exists: ue, privileged: priv_, write_intent: false, learn_pref: false }
+    }
+
+    fn facts_w(se: bool, sr: bool, sw: bool, ue: bool, priv_: bool) -> StateFacts {
+        StateFacts { system_exists: se, system_readable: sr, system_writable: sw, user_exists: ue, privileged: priv_, write_intent: true, learn_pref: false }
+    }
+
+    fn facts_learn(se: bool, sr: bool, ue: bool, priv_: bool) -> StateFacts {
+        // `qexo learn --status`: the learn preference without
+        // write intent (a session carries both flags; the
+        // preference rows are the same when a deck exists).
+        StateFacts { system_exists: se, system_readable: sr, system_writable: true, user_exists: ue, privileged: priv_, write_intent: false, learn_pref: true }
+    }
+
     #[test]
-    fn android_state_path_pick_prefers_canonical_then_home() {
-        let home = Some(PathBuf::from("/data/data/com.termux/files/home"));
-        // canonical usable (a rooted device, or proot): no fallback
-        assert_eq!(
-            pick_android_state_path(true, home.clone()),
-            PathBuf::from("/var/lib/qexo/state.phext")
+    fn resolution_order_is_the_shipped_order() {
+        let sys = std::path::Path::new("/var/lib/qexo/state.phext");
+        let usr = std::path::Path::new("/home/op/.qexo/state.phext");
+        // system exists + readable: canonical, whoever asks
+        assert_eq!(pick_state_path(facts(true, true, true, false), sys, Some(usr)), sys);
+        assert_eq!(pick_state_path(facts(true, true, false, true), sys, Some(usr)), sys);
+        // system exists but unreadable, per-user state exists:
+        // read-only verbs land on the per-user state, never fail
+        assert_eq!(pick_state_path(facts(true, false, true, false), sys, Some(usr)), usr);
+        // only the per-user state exists
+        assert_eq!(pick_state_path(facts(false, false, true, false), sys, Some(usr)), usr);
+        // system exists, unreadable, no per-user state: the real
+        // file is named (its error will say so), not shadowed
+        assert_eq!(pick_state_path(facts(true, false, false, false), sys, Some(usr)), sys);
+        // nothing exists: privileged births system, plain users
+        // birth per-user; no home at all falls back to system
+        assert_eq!(pick_state_path(facts(false, false, false, true), sys, Some(usr)), sys);
+        assert_eq!(pick_state_path(facts(false, false, false, false), sys, Some(usr)), usr);
+        assert_eq!(pick_state_path(facts(false, false, false, false), sys, None), sys);
+    }
+
+    #[test]
+    fn resolution_write_intent_never_adopts_an_unwritable_system_state() {
+        let sys = std::path::Path::new("/var/lib/qexo/state.phext");
+        let usr = std::path::Path::new("/home/op/.qexo/state.phext");
+        // THE v1.4.1 DEFECT ROW: system state exists, is readable,
+        // is NOT writable by this unprivileged process, and the
+        // verb intends to write (learn on a fleet node) — the
+        // per-user state is selected, whether or not it exists yet
+        assert_eq!(pick_state_path(facts_w(true, true, false, true, false), sys, Some(usr)), usr);
+        assert_eq!(pick_state_path(facts_w(true, true, false, false, false), sys, Some(usr)), usr);
+        // a system state this user CAN write stays canonical
+        assert_eq!(pick_state_path(facts_w(true, true, true, false, false), sys, Some(usr)), sys);
+        // root is never diverted (the fleet's behavior is unchanged)
+        assert_eq!(pick_state_path(facts_w(true, true, false, true, true), sys, Some(usr)), sys);
+        // nothing exists yet: the v1.4.0 birth order is untouched
+        assert_eq!(pick_state_path(facts_w(false, false, false, false, false), sys, Some(usr)), usr);
+        assert_eq!(pick_state_path(facts_w(false, false, false, false, true), sys, Some(usr)), sys);
+        // no home to anchor to: fall through to the honest path
+        assert_eq!(pick_state_path(facts_w(true, true, false, false, false), sys, None), sys);
+    }
+
+    #[test]
+    fn resolution_learn_prefers_an_existing_per_user_deck() {
+        let sys = std::path::Path::new("/var/lib/qexo/state.phext");
+        let usr = std::path::Path::new("/home/op/.qexo/state.phext");
+        // the operator HAS a deck: learn reads it, not the
+        // machine owner's — even though the system state is
+        // readable (v1.4.0's order showed the owner's deck)
+        assert_eq!(pick_state_path(facts_learn(true, true, true, false), sys, Some(usr)), usr);
+        // THE v1.4.1 REGRESSION ROW: no per-user state yet —
+        // learn falls through to the shipped order and the
+        // readable system deck ANSWERS (v1.4.1 diverted to the
+        // missing path and errored "not born")
+        assert_eq!(pick_state_path(facts_learn(true, true, false, false), sys, Some(usr)), sys);
+        // root's learn is root's own: never diverted
+        assert_eq!(pick_state_path(facts_learn(true, true, true, true), sys, Some(usr)), sys);
+        // nothing anywhere: the birth order decides, as shipped
+        assert_eq!(pick_state_path(facts_learn(false, false, false, false), sys, Some(usr)), usr);
+    }
+
+    #[test]
+    fn topup_seeds_only_what_is_missing() {
+        // a document carrying every index but the tens (the
+        // 1.3.0-born shape): exactly one seed, and every scroll
+        // it already held is byte-identical afterwards
+        let mut px = Phext::new();
+        px.insert(IDENTITY, record(&[("kind", "identity"), ("node", "topup-test")]));
+        regen_indexes(&mut px);
+        px.scrolls.remove(&index_addr(HL_LEARN));
+        let before = px.clone();
+        let seeded = seed_missing_indexes(&mut px);
+        assert_eq!(seeded, vec![index_addr(HL_LEARN)]);
+        for (a, t) in &before.scrolls {
+            assert_eq!(px.get(a), Some(t), "existing scroll at {:?} was touched", a);
+        }
+        assert!(px.get(&index_addr(HL_LEARN)).is_some());
+        // idempotent: a whole state seeds nothing
+        assert!(seed_missing_indexes(&mut px).is_empty());
+    }
+
+    #[test]
+    fn fixture_state_born_under_130_tops_up_on_save() {
+        // THE STANDING REGRESSION (v1.4.1): a real state born by
+        // the published 1.3.0 binary (tests/fixtures/, generated
+        // by that binary's own `qexo config`, never hand-edited)
+        // predates the lessons homeland. Loading it and saving —
+        // any write verb's ending — must top it up: the learn
+        // index appears, doctor's lattice check goes clean, and
+        // every scroll the 1.3.0 binary wrote survives untouched.
+        let text = include_str!("../tests/fixtures/state-1.3.0.phext");
+        let dir = std::env::temp_dir().join(format!("qexo-fixture-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.phext");
+        std::fs::write(&path, text).unwrap();
+        let mut lat = Lattice::load_from(&path).unwrap().expect("fixture loads");
+        assert!(lat.px.get(&index_addr(HL_LEARN)).is_none(), "fixture must predate the learn homeland");
+        let report = crate::doctor::check_lattice(&lat);
+        assert_eq!(report.problems(), 1, "the only complaint is the missing learn index: {}", report.render());
+        assert!(report.findings.iter().any(|f| !f.ok && f.fixable && f.item.contains("lessons")), "{}", report.render());
+        let before = lat.px.clone();
+        lat.save().unwrap();
+        let back = Lattice::load_from(&path).unwrap().expect("saved state loads");
+        assert!(back.px.get(&index_addr(HL_LEARN)).is_some(), "learn index topped up");
+        assert!(crate::doctor::check_lattice(&back).ok(), "doctor clean after the top-up");
+        for (a, t) in &before.scrolls {
+            assert_eq!(back.px.get(a), Some(t), "predecessor scroll at {:?} was touched", a);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolution_system_path_is_byte_identical_to_v130() {
+        // system installs keep working byte-for-byte: the system
+        // path is the same string v1.3.0 used.
+        assert_eq!(system_state_path(), PathBuf::from("/var/lib/qexo/state.phext"));
+    }
+
+    #[test]
+    fn learn_homeland_regenerates_its_index() {
+        let mut px = Phext::new();
+        px.insert(
+            at(HL_LEARN, [LEARN_DECK_C, 1, 1, 1, 1, 1]),
+            record(&[("kind", "learn card"), ("id", "verbs-config"), ("front", "f"), ("back", "b"), ("due", "10"), ("interval_days", "1"), ("ease", "2.5"), ("reps", "0"), ("lapses", "0")]),
         );
-        // canonical not creatable (stock Termux): the node lives
-        // under $HOME/.qexo, where its operator can find it
-        assert_eq!(
-            pick_android_state_path(false, home),
-            PathBuf::from("/data/data/com.termux/files/home/.qexo/state.phext")
-        );
-        // no HOME either: canonical anyway — the birth error names
-        // the path instead of a third place being invented
-        assert_eq!(
-            pick_android_state_path(false, None),
-            PathBuf::from("/var/lib/qexo/state.phext")
-        );
+        regen_indexes(&mut px);
+        let idx = px.get(&index_addr(HL_LEARN)).expect("learn index written");
+        assert!(idx.contains("10.10.10/10.10.10/10.10.10"), "{}", idx);
+        assert!(idx.contains("verbs-config"), "{}", idx);
+        assert!(idx.contains("cards: 1"), "{}", idx);
+        let home = px.get(&HOME).expect("home index");
+        assert!(home.contains("lessons & learning: 1 card(s)"), "{}", home);
+        assert_eq!(index_addr(HL_LEARN), [10, 10, 10, 10, 10, 10, 10, 10, 10]);
     }
 }
 
