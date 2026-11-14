@@ -1,0 +1,19 @@
+[package]
+name = "qexo"
+version = "1.3.0"
+description = "qexo — the Exocortex coordinator, phext-native: all node state lives in /var/lib/qexo/state.phext (Layer 2 addressing over phext)"
+license = "MIT"
+edition = "2021"
+
+# The bake/ directory holds build-time generated artifacts
+# (tools/build_bake_remote.py from qexo-bake.toml). It is included in
+# the package so the published crate builds anywhere; bake/ itself is
+# never a hand-edited source.
+include = [
+    "src/**", "bake/**", "census.tsv",
+    "Cargo.toml", "CHANGELOG.md", "SHIP-NOTES.md", "VERSION",
+    "qexo-bake.toml", "docs/**", "README.md",
+]
+
+[profile.release]
+opt-level = 2

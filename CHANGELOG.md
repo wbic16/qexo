@@ -1,0 +1,356 @@
+# qexo changelog — the scratch line
+
+## 1.3.0 (v1.3.0) — the Android port, 2026-11-13
+
+qexo runs on Android as a full phextnet node, in Termux: this
+repo (wbic16/qexo) carries the port; the source descends from
+wbic16/quarterexo @ 833e2f34 (v1.2.0) and the port is the diff.
+The phone holds durable state and a real GPG identity, which a
+browser tab cannot — that is why the port is Android, not web.
+
+- Target: `aarch64-linux-android`, built with the Android NDK
+  (r27c) clang as linker. The codebase is dependency-free std
+  plus hand-rolled FFI, and the unix family carried almost
+  everything: bionic has statvfs (the v1.0.2 volume probe links
+  unchanged), /proc exists, PermissionsExt works. The link —
+  not the check — is the gate, per the v1.0.4 lesson.
+- State path: /var/lib/qexo is not writable under Termux. On
+  Android only, when QEXO_STATE is unset and the canonical
+  directory cannot be created, the node lives at
+  $HOME/.qexo/state.phext — and says so: config prints the
+  fallback note at birth, and `qexo status` prints the path in
+  use, as everywhere. Desktop behavior is untouched (the
+  fallback is cfg(target_os = "android")-scoped; the pick is a
+  pure function with a unit test that runs on any host).
+- Timers, told plainly: the automatic update/evolve timer is
+  a systemd unit and Android has no systemd. The installer's
+  capability probes (root, /run/systemd/system, systemctl)
+  all fail there, and on Android the report says exactly that
+  and names the manual act instead — run `qexo evolve` (or
+  `qexo update`) from Termux when you want a pass. No fake
+  success, no systemd unit texts printed at a phone.
+- GPG is unchanged: crypto still spawns the `gpg` tool, which
+  Termux provides as `pkg install gnupg`.
+- Phone route: Termux (F-Droid build) + the Tailscale app,
+  `pkg install gnupg`, place the qexo binary and chmod +x,
+  `qexo config` to birth the node, register the fleet signer
+  with its tailnet endpoint, set release_signer in the config
+  record, then `qexo update --check` / `qexo evolve --check`.
+- Honest limit, same shape as the Windows one: the binary is
+  built and LINKED on the ranch; no Android runtime exists
+  there, so execution on a real phone is the operator's
+  report, not a gate result.
+
+## 1.2.0 (v1.2.0) — built and gated, 2026-11-13
+
+`qexo evolve` — one receipted convergence pass over the
+phextnet. The reading, in one paragraph (Will's order was two
+words, "qexo evolve"; this reading is Emise's, stated so it
+can be struck): `update` moves the binary; `evolve` is the
+node's full convergence pass — everything a node can learn
+from its peers, applied in one receipted cycle. What a node
+knows, what its personas have become elsewhere, and what its
+binary should be are three faces of one question — how far
+has this node drifted from the network it belongs to — and
+evolve answers it in a single pass that leaves a single
+receipt.
+
+The four stages, in order, each independently failable — a
+stage's failure never blocks the next, and every outcome
+lands in the receipt:
+
+1. **Peer gossip.** For each trusted peer with an endpoint,
+   the pass reads its peers index (serve gains a general
+   scroll-by-coordinate route, `/v1/scroll/<coord>`, to carry
+   it) and fetches each record the index names.
+   Peers-of-peers this node does not know are recorded in the
+   peers homeland as `status: discovered`, with a `via` field
+   naming the reporting peer and the reported fingerprint
+   (plus endpoint when the report carries one).
+2. **Persona sync.** Persona records now carry a lineage —
+   `revision` (1 at birth, +1 per local edit), `follows` (the
+   revision and stamp the copy directly succeeds — the scroll
+   names the revision it follows), `history` (the stamp
+   chain), and `stamp` (a content address: sha256 over name +
+   revision + follows + boot). For each persona this node
+   holds, trusted peers are polled for their copy (found
+   through the peer's own personas index). A copy whose
+   history extends ours is a descendant and is adopted whole;
+   a copy behind ours is noted; anything else is a fork.
+3. **Self-update.** The v1.1.0 mechanism, invoked in-process
+   — same trust rule, same swap, rollback, and receipts;
+   evolve's receipt references its outcome.
+4. **The evolution receipt.** One scroll per pass in the
+   ledgers homeland's receipts family: peers polled / learned
+   / confirmed, personas considered / adopted, divergences
+   kept, the binary outcome, and every warning, each named.
+
+The two trust rules. **Discovery is knowledge, not trust:** a
+discovered peer is never polled for releases, never synced
+from, and never eligible as `release_signer` — every polling
+path iterates only records whose status is `registered`, and
+a discovered record becomes trusted only when the operator
+registers its key (`qexo register` then promotes the record
+in place, keeping its `via` provenance). A gossip report that
+matches a trusted peer's fingerprint is a consistency check;
+a fingerprint conflict for a known name is a warning line in
+the receipt, never a silent overwrite. **Divergence keeps
+both:** when two nodes advance the same persona from a common
+ancestor differently, the incoming copy lands at a sibling
+address in the same persona cluster as an attempt artifact
+named by its origin node (the KSO ruling) — never
+last-writer-wins, never a silent drop, and the receipt names
+every divergence kept.
+
+`qexo evolve --check` performs every read and prints the
+plan, and writes nothing at all: the knowledge stages run
+against a throwaway copy of the lattice and the binary stage
+runs in a judge-only mode that suppresses even the refusal
+receipts `qexo update --check` has always written — verified
+byte-for-byte against a hashed fixture. `update ⊂ evolve`:
+the v1.1.0 auto timer's trigger becomes `qexo evolve` when
+the new config key `evolve: on` is set (`qexo config
+--evolve`; default off; flipping it while the timer is
+installed reinstalls the unit with the new trigger — a unit
+names its command, so the key alone never pretends to
+rewrite it). Manual `qexo evolve` always converges, whatever
+the key says; the key only steers the timer. Persona records
+born before lineage existed are not rewritten: they read as
+revision-1 roots whose stamp is computed from their content,
+and identical roots share ancestry by construction.
+
+## 1.1.0 (v1.1.0) — built and gated, 2026-11-12
+
+Automatic updates over the phextnet: qexo nodes now update
+themselves through qexo's own peer network — not through
+GitHub, a package repo, or anyone's hands.
+
+The mechanism. A release is announced as a signed scroll: the
+signer runs `qexo release`, which stages the running binary in
+a `releases/` directory beside its state file and writes a
+manifest record into the ledgers homeland of its state.phext —
+version, sha256, size, built-from commit, signer fingerprint —
+with a detached GPG signature over the manifest scroll itself
+in the adjacent scroll. `qexo serve` carries the manifest and
+its signature as scroll text (the existing routes' shape) and
+the binary at one byte route, `/release/qexo-<version>`. The
+manifest is the trust object — what travels and what gets
+verified; the bytes are just bytes, and integrity never
+depends on the transport.
+
+The trust rule. `qexo update` polls the registered peers'
+serve endpoints and applies a release only when ALL of these
+hold: the manifest's signature verifies, and the fingerprint
+it verifies under is exactly the config record's
+`release_signer` AND that key stands in the node's own peer
+registry; the offered version is strictly newer than the
+running binary (never a downgrade, never a same-version swap);
+and the downloaded bytes hash to the manifest's sha256. The
+swap is renames within the binary's directory: the old binary
+keeps as `qexo.prev`, the new one must speak its version and
+pass doctor against the node's state, and any failure rolls
+back to `qexo.prev`. Every applied, rolled-back, or refused
+attempt writes a receipt scroll. An offer that CLAIMS the
+trusted signer but fails verification is a hard stop with a
+receipt — that shape is impersonation, and the node does not
+shop around. Offers signed by anyone else are noted and
+ignored: each node's trust is its own config record's word.
+`qexo update --check` reports only. `qexo config
+--auto-update` sets `auto_update: on` and installs a systemd
+timer (`qexo update` every `update_interval_hours`) where
+systemd + root allow — and says plainly, with the unit files
+printed, where it can't; the timer is a thin trigger and every
+decision stays inside `qexo update`.
+
+Supporting changes. Peer records gain an `endpoint` field —
+`qexo register <pubkey> --endpoint <url>` records it, and
+re-registering a known key backfills it; `qexo update` names
+every registered peer that has no endpoint rather than
+guessing one. serve's bind address becomes the config key
+`serve_bind` (default 127.0.0.1, as before): a node that wants
+phextnet traffic sets it to its tailnet address. The config
+record gains the update keys visibly at birth and by backfill:
+serve_bind, auto_update (off), update_interval_hours (24),
+release_signer (EMPTY — trust is an operator's act, never a
+default).
+
+Fleet prerequisite, stated as operator steps, not fine print:
+(1) cross-register the nodes' public keys so each node's
+registry holds the signer's key; (2) register with endpoints
+(or backfill them) so peers are pollable; (3) set
+`release_signer: <fingerprint>` in each node's config record;
+(4) on the signer, set `serve_bind` to its tailnet address and
+run serve where peers can reach it. Until steps 1–3 are done,
+`qexo update` answers with the plain refusal those steps
+answer — "no trusted release signer configured" — which is
+the fleet's true state tonight: keys exist on 19 nodes,
+cross-registration has not run.
+## 1.0.4 (v1.0.4) — built and gated, 2026-11-12
+
+The disk probe declared POSIX on every platform. probe_disk
+read its volume through an unconditional `extern "C" statvfs`
+— a symbol Windows does not have — so the Windows build of
+v1.0.3 failed at link time with `unresolved external symbol
+statvfs`, reported by Will from exo 1b819c2. The unix build
+linked fine, and the v1.0.1 gate set could not have caught
+it: those gates ran `cargo check` for the Windows targets,
+and check never links, so an unsatisfiable extern sails
+through. The gate set now includes a full Windows link
+(`cargo build --target x86_64-pc-windows-gnu`, producing
+qexo.exe), not just checks.
+
+The volume read is now one function per platform, behind
+`volume_at(root) -> Option<Volume>`: unix keeps the statvfs
+read with identical semantics (total = f_blocks, used =
+f_blocks − f_bfree, free = f_bavail — df's Used/Avail);
+Windows reads the volume through kernel32
+GetDiskFreeSpaceExW, mapped into the same terms (used =
+total − total-free-bytes; free = bytes available to the
+caller, the quota-aware f_bavail analog), so the gate cannot
+tell which platform measured; any other platform — and any
+failure — yields no volume, which plan already tolerates
+(every consumer reads the volume through Option). The
+mapping is a pure function, unit-tested on every platform.
+The file-count half of the probe is unchanged, as is all
+unix behavior. An audit of the rest of src/ found no other
+unconditional unix extern: doctor's kernel32 block is
+cfg(windows) (v1.0.1), the PermissionsExt uses sit inside
+cfg(unix) blocks, and the /proc reads (hostname, meminfo,
+loadavg) are ordinary file reads with graceful fallbacks —
+on Windows they simply find nothing, which is a snapshot
+that reads empty, not a build that fails.
+
+## 1.0.3 (v1.0.3) — built and gated, 2026-11-12
+
+The forecast kept the old VM ceilings after the gate moved.
+v1.0.2 re-based the disk gate on the volume a node stands on —
+a volume lens, a quota lens only where configured — but the
+forecast gate was left untouched, still projecting crossings of
+the legacy absolute levels: byte AMBER at 95 GB, byte RED at
+102 GB. Every ranch volume already sits past 95 GB used, so on
+the 2026-11-12 fleet rollout the second plan read on any node
+flipped its headline to "AMBER — FORECAST AMBER — byte AMBER
+(95 GB) projected in 0.0 days" over a gate that was GREEN with
+66–92% of the volume free. A forecast that contradicts the gate
+it forecasts is a bug, and this corrects it.
+
+The forecast now projects the crossings of the same lenses the
+gate reads, from the same config record: the volume lens's
+levels are the used amounts at which this volume's free
+fraction crosses the configured AMBER/RED percentages; the
+quota lens contributes crossings only on nodes that have it on,
+and they are named as quota crossings in the node's own
+numbers; the file lens reads its thresholds from the config
+record as before. The hardcoded 95/102 levels are deleted from
+the forecast path — the only place those numbers remain is as
+the quota lens's config defaults, off by default.
+
+Two projection rules changed with the levels, both forced by
+the same evidence. A crossing the current reading has already
+reached is the gate's verdict, not a forecast, and is no longer
+projected at 0.0 days. And projections are reported only
+within a one-year horizon: a linear rate is a short-horizon
+instrument, and a crossing tens of thousands of days out (the
+ranch case: ~2,900 GB away at +0.06 GB/day) is reported as no
+crossing rather than lent a day count it has not earned. The
+old forecast tests that asserted the legacy levels were
+rewritten to the lens semantics; the ported file-growth
+scenario (+59,021 files/day, file AMBER ~1.4 days out, forecast
+escalation) passes unchanged, because the file lens never moved.
+
+## 1.0.2 (v1.0.2) — built and gated, 2026-11-12
+
+The disk gate judged every node by the Muse VM's quota. Its
+absolute thresholds (AMBER at 95 GB used, RED at 102 GB) were
+calibrated to that one machine's staging quota — the 2026-11-08
+EDQUOT failure — and ported value-for-value through every line
+since, while the probe measured used bytes on whatever volume
+it happened to stand on. Run on aletheia-core, the gate read
+RED at 809 GB used on a 3.6 TB volume with 2.7 TB free and held
+every placement on a healthy machine.
+
+Now the gate measures the volume it stands on. The probe returns
+the volume's total/used/free bytes (statvfs, as before, but the
+probe no longer carries verdicts); the gate reads through two
+lenses — a volume lens (AMBER under 25% free, RED under 10%
+free) and a quota lens (the old absolute ceiling, on only where
+a node configures it, because the VM's quota is a real ceiling
+on that machine and nowhere else) — plus the file lens, which
+now counts files under a named staging root and says so. Every
+threshold lives in the node's config record in state.phext,
+seeded visibly by `qexo config`: volume_lens,
+disk_gate_free_amber_pct, disk_gate_free_red_pct, quota_lens,
+quota_amber_gb, quota_red_gb, staging_root, file_amber,
+file_red. Absent keys mean the defaults (volume lens only).
+
+The plan renders the volume in GiB — the units df speaks,
+labeled — names the measured root and the counted root, and
+states which lens fired and the numbers it fired on. The HOLD
+copy names the measured root instead of "the VM" wherever the
+binary runs. The level recorded with each telemetry observation
+is the gate's own evaluation under the node's configuration;
+the old mechanism of an external watcher's level word forcing
+the gate is retired (the series is qexo's own now). Forecast
+gate behavior is unchanged. Gates: the decisive trio as unit
+tests (ranch volume GREEN at the incident's own numbers; VM
+ceiling AMBER/RED by configuration alone; a 5%-free volume RED
+regardless of absolute size), the ported battery, cargo test,
+release build, wiring check — all on aletheia-core. Stacked on
+the v1.0.1 doctor slice (PR #9); the base retargets to exo when
+that merges.
+
+## 1.0.1 (v1.0.1) — built and gated, 2026-11-12
+
+A Windows correctness fix for doctor, in two parts. The doctor
+test encoded unix permission semantics as if they were
+universal: it seeded the keyring at mode 0755 and asserted a
+repair to 0700 — on Windows there are no permission modes to
+read or set, so the test could never pass there. And behind the
+test sat a real bug: lock liveness was judged by /proc/{pid},
+which never exists on Windows, so a lock held by a *live* qexo
+process would have been judged stale and doctor --fix would
+have deleted it.
+
+Now: liveness is probed per platform (unix /proc; Windows
+OpenProcess + GetExitCodeProcess via kernel32, std-only), and
+a pid whose liveness cannot be judged reads as alive — doctor
+never deletes a lock it cannot judge. The keyring check on
+non-unix platforms reports itself present and ok, with the
+detail that permission modes are a unix concept and do not
+apply there; the repair path claims nothing it cannot do.
+The test asserts the platform-neutral repairs (missing
+directory, stale lock) everywhere and the mode repair on unix
+only, and asserts the not-applicable keyring finding exists
+off-unix. No behavior change on unix. Gates: cargo test on
+the ranch (unix), release build, wiring check, and a clean
+`cargo check --tests` for the x86_64-pc-windows-gnu target;
+Windows runtime execution is verified on Will's machine, not
+the ranch.
+
+## 1.0.0 (v1.0) — built and gated, 2026-11-12
+
+A from-scratch line. The old line (0.x, in git history) kept its
+node state in JSON documents and JSONL ledgers; JSON was the wrong
+substrate for a phext-native tool, so this line replaces it rather
+than decorating it: all node state lives in one phext file,
+/var/lib/qexo/state.phext, and there is no JSON anywhere in qexo's
+own machinery — the one foreign edge that speaks it (Ollama) is a
+translation module, isolated and named.
+
+There are no deployments of the old line, so nothing migrates:
+state is born at `qexo config`, empty, with the neighborhood map
+laid down.
+
+Built in two passes: the map-free parts first (format, seal,
+hash, GPG mechanics, the Ollama edge, the plan's pure core,
+doctor's filesystem layer, the CLI, the wiring gate) with the
+state commands held, then the addressing layer and the state
+commands under the corrected Layer 2 map (docs/LAYER2.md v2 —
+the first map was withdrawn the day it was issued because it
+treated coordinates as a key-space instead of places). One
+format fix landed on the way: the phext serializer now walks
+the dead-reckoning path in delimiter stacks and the parser
+holds the scroll-existence rule — the single-delimiter form
+could not represent the homeland addresses at all. Gates:
+29/29 cargo tests, 59/59 CLI battery, wiring ok, json confined
+to the inference edge and one rule-stating comment.
