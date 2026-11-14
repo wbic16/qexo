@@ -1,3 +1,32 @@
+# qexo v1.6.1 — ship notes (the Android app becomes a control surface; home: wbic16/qexo)
+
+Status: v1.6.1 BUILT AND GATED, 2026-11-14 — one change on
+top of the v1.6.0 tree below: `qexo learn --app`, the wizard's
+engine over a plain-text line protocol (status / chapters /
+lesson / next / practice / reveal / grade / quit; `key: value`
+replies), so a front-end with no terminal can run a real card
+session. The engine, deck, chapter map, and state records are
+the wizard's own — nothing duplicated, nothing altered; the
+TUI and --status paths are byte-unchanged.
+
+The Android launcher v2 drives it: an in-app Learn session
+(card front, Reveal, Again/Good/Easy, progress line) plus the
+high-payoff verbs one tap from home — Update, Evolve, Doctor,
+Repair, List peers, Inventory, Status — with the --check
+forms demoted to a secondary row. The trial APK is signed
+with the same Android Debug certificate as the shipped
+v1.6.0 APK, so it installs over it and the phone node's state
+carries over untouched.
+
+Sync debt, named: the --app protocol is shared code, so a
+quarterexo twin is owed under the two-repo rule
+(29.6.7/6.5.7/6.5.8); it queues behind quarterexo PR #22 and
+is NOT in this change. App icons remain owed; none fabricated.
+No Android runtime exists on the ranch — phone execution is
+the operator's report, as before. See CHANGELOG 1.6.1.
+
+---
+
 # qexo v1.6.0 — ship notes (the Android repo comes current; home: wbic16/qexo)
 
 Status: v1.6.0 BUILT AND GATED, 2026-11-14 — this repo's tree
