@@ -401,3 +401,40 @@ sparse_patterned_addresses_roundtrip.
   (the translation module) and one rule-stating comment in
   src/lattice.rs.
 
+## Twin sync — the dispatch core arrives (2026-11-17)
+
+wbic16/qexo is the twin: the same qexo, carried in the
+repo the Android builds ride. It had fallen behind
+wbic16/quarterexo by the whole dispatch core — its exo
+tree still stamped 1.7.0 and held none of slices 1–6.
+This sync ports quarterexo's tree at exo 83e0580a (slice 6
+merged) plus slice 7's --app drivers, at platform stamp
+1.7.3 in both trees.
+
+What stands here now: src/bridge.rs, src/dispatch.rs,
+src/register.rs, src/wire.rs, and src/app.rs are new to
+this tree; the queue's transition oracle, the scoped
+register drain, wire dispatch with fair placement, F5
+resume/teleport, the bridge registry with calculated
+health, and the app session protocol are the same code
+quarterexo gates against. The tree diff between the two
+repos after this sync is exactly the sanctioned remainder:
+src/core.rs (this tree's Android timer truth — Android
+has no systemd, and the update timer says so and points
+at Termux), and the two per-repo documents,
+CHANGELOG.md and SHIP-NOTES.md, which each repo keeps in
+its own voice.
+
+Not in this sync: a version bump or a release — that is
+slice 8's work in quarterexo, and this tree follows when
+it lands. No APK was built or published from this tree.
+
+Gate record (aletheia-core, 2026-11-17): cargo test
+159/159 — the same count as quarterexo's tree (the
+Android block is cfg'd out on this host); the scripted
+--app session transcripts of the two builds are
+byte-identical after normalizing node fingerprints,
+bundle hashes, minute stamps, and draw seeds;
+windows-gnu and Android aarch64 full LINKs green on
+this tree; the tree diff against quarterexo is exactly
+src/core.rs, CHANGELOG.md, and SHIP-NOTES.md.

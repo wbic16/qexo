@@ -347,6 +347,7 @@ pub fn check_lattice(lat: &Lattice) -> Report {
         (lattice::HL_TELEMETRY, "telemetry index"),
         (lattice::HL_CONFIG, "config & wiring index"),
         (lattice::HL_LEARN, "lessons & learning index"),
+        (lattice::HL_DISPATCH, "dispatch & queue index"),
     ] {
         let addr = lattice::index_addr(h);
         findings.push(Finding {
@@ -415,6 +416,7 @@ pub fn fix_lattice(lat: &mut Lattice) -> Vec<String> {
         (lattice::index_addr(lattice::HL_TELEMETRY), "telemetry index"),
         (lattice::index_addr(lattice::HL_CONFIG), "config & wiring index"),
         (lattice::index_addr(lattice::HL_LEARN), "lessons & learning index"),
+        (lattice::index_addr(lattice::HL_DISPATCH), "dispatch & queue index"),
     ];
     let before: Vec<Option<String>> = watched.iter().map(|(a, _)| lat.px.get(a).cloned()).collect();
     lattice::regen_indexes(&mut lat.px);
@@ -425,6 +427,521 @@ pub fn fix_lattice(lat: &mut Lattice) -> Vec<String> {
         }
     }
     done
+}
+
+// ----------------------------------------------------------------
+// The queue reconciliation (dispatch core slice 2, spec §4.5):
+// calculated from the records on every run, never stored.
+// ----------------------------------------------------------------
+
+use crate::dispatch::{self, ItemState};
+
+/// The (receipt Book, item) pairs filed under a kind
+/// receipt's `action:` in the receipts ledger —
+/// detection and verified-progress receipts are not
+/// transitions, so the transition loader never sees
+/// them; the doctor reads them raw (§8).
+fn kind_receipt_books(px: &crate::phext::Phext, action: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    for b in lattice::component_values(px, &[6, 6, 6, lattice::LEDGER_RECEIPTS, 1], 5) {
+        let addr = lattice::at(lattice::HL_LEDGERS, [lattice::LEDGER_RECEIPTS, 1, b, 1, 1, 1]);
+        if let Some(t) = px.get(&addr) {
+            if lattice::field(t, "action").as_deref() == Some(action) {
+                if let Some(item) = lattice::field(t, "item") {
+                    out.push((b, item));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The set of items named by kind receipts of `action`.
+fn kind_receipt_items(px: &crate::phext::Phext, action: &str) -> std::collections::HashSet<String> {
+    kind_receipt_books(px, action).into_iter().map(|(_, i)| i).collect()
+}
+
+/// Doctor's queue section. The §4.5 counts: items by state;
+/// terminal items lacking a receipt (must be 0); receipts
+/// citing no live item (must be 0); assignments whose
+/// heartbeat is stale (counted here; since slice 5 the
+/// F5 path acts on them — a stale assignment for an item
+/// homed here with no detection on file is a finding,
+/// and the failure counter is checked against its
+/// receipted history, §8); an audit record for every
+/// non-ping closure (a closure without one is a finding,
+/// §7.2 — a register-close audit satisfies it for a
+/// register-driven closure, §10.3). Slice 3 adds the
+/// register link's integrity: a register-born item with
+/// no register-seq, a register-seq carried by two items,
+/// and the pending write-back count (visible, never a
+/// failure — the drain's sweep retries them, §10.4). The
+/// §4.6 illegal combinations are checked one by
+/// one, each in its own words. No queue finding is fixable
+/// by doctor: the repair is a transition or Will's hand,
+/// never an invention — a nonzero must-be-0 count is a
+/// doctor failure of the same class as a missing homeland
+/// index (§4.5).
+pub fn check_queue(lat: &Lattice) -> Report {
+    let px = &lat.px;
+    let mut findings = Vec::new();
+    let items = dispatch::load_items(px);
+    let receipts = dispatch::load_transition_receipts(px);
+    let audits = dispatch::load_audits(px);
+    let assignments = dispatch::load_assignments(px);
+
+    // Items by state — calculated, never stored.
+    let mut counts: Vec<String> = Vec::new();
+    for s in dispatch::ALL_STATES {
+        let n = items.iter().filter(|i| i.state == Some(s)).count();
+        if n > 0 {
+            counts.push(format!("{} {}", n, s.name()));
+        }
+    }
+    let unknown = items.iter().filter(|i| i.state.is_none()).count();
+    if unknown > 0 {
+        counts.push(format!("{} in an unknown state", unknown));
+    }
+    findings.push(Finding {
+        item: "queue reconciliation".into(),
+        ok: true,
+        detail: if items.is_empty() {
+            "queue: 0 item(s)".to_string()
+        } else {
+            format!("queue: {} item(s) — {}", items.len(), counts.join(", "))
+        },
+        fixable: false,
+    });
+
+    let item_addrs: std::collections::HashSet<String> =
+        items.iter().map(|i| crate::phext::fmt_coord(&i.addr)).collect();
+    let local_node = px
+        .get(&lattice::IDENTITY)
+        .and_then(|t| lattice::field(t, "node"))
+        .unwrap_or_default();
+    let local_actor = dispatch::local_actor(px);
+
+    for item in &items {
+        let addr_s = crate::phext::fmt_coord(&item.addr);
+        let bad = |detail: String| Finding { item: "queue integrity".into(), ok: false, detail, fixable: false };
+        if item.state.is_none() {
+            findings.push(bad(format!(
+                "{}: state '{}' is not a queue state (§4.6)",
+                addr_s, item.state_raw
+            )));
+            continue;
+        }
+        let state = item.state.unwrap();
+        if !item.attempts_raw.is_empty() && item.attempts_raw.parse::<u32>().is_err() {
+            findings.push(bad(format!("{}: attempts: '{}' is not a count", addr_s, item.attempts_raw)));
+        }
+        if !item.failures_raw.is_empty() && item.failures_raw.parse::<u32>().is_err() {
+            findings.push(bad(format!("{}: failures: '{}' is not a count", addr_s, item.failures_raw)));
+        }
+        // Illegal combination 5: waiting with no register cite.
+        if state == ItemState::Waiting
+            && item.register.as_deref().map(|r| r.trim().is_empty()).unwrap_or(true)
+        {
+            findings.push(bad(format!(
+                "{}: waiting with no register number cited (illegal combination 5, §4.6)",
+                addr_s
+            )));
+        }
+        // Slice 3 (§10.3): a register-born item carries the
+        // entry seq it was drained at — that seq is the
+        // drain's dedup key. Origin `register` without one
+        // means the record was filed by something that did
+        // not drain it.
+        if item.origin == "register"
+            && item.register_seq.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
+        {
+            findings.push(bad(format!(
+                "{}: register-born item with no register-seq — the drain files the seq it drained at (§10.3)",
+                addr_s
+            )));
+        }
+        // Illegal combination 3: the auto-pause counter rules.
+        if state == ItemState::PausedAuto && item.failures < 3 {
+            findings.push(bad(format!(
+                "{}: paused-auto with failures: {} < 3 (illegal combination 3, §4.6)",
+                addr_s, item.failures
+            )));
+        }
+        if state == ItemState::Queued && item.failures >= 3 {
+            findings.push(bad(format!(
+                "{}: queued with failures: {} ≥ 3 and no intervening verified progress or manual resume (illegal combination 3, §4.6)",
+                addr_s, item.failures
+            )));
+        }
+        // Illegal combination 7: the cited attempt universe
+        // does not exist. Attempts live in this node's chain
+        // for items homed here; an item whose `home:` names
+        // another node keeps its attempts there.
+        if item.attempts >= 1 {
+            let home_here = item.home.as_deref().map(|h| h == local_node).unwrap_or(true);
+            if home_here && lat.universe_count() < (item.attempts as usize) + 1 {
+                findings.push(bad(format!(
+                    "{}: cites attempt universe ${} but the state chain holds {} universe(s) (illegal combination 7, §4.6)",
+                    addr_s,
+                    item.attempts + 1,
+                    lat.universe_count()
+                )));
+            }
+        }
+        // Illegal combination 6: the bundle hash. The shape
+        // is checkable today; a divergent attempt-universe
+        // copy is checkable today; and (slice 4, the block
+        // after the terminal checks) the digest recomputed
+        // from an attempt universe's contents — the
+        // canonical bundle rebuilt by the builder that
+        // landed with wire dispatch — must equal it.
+        if let Some(h) = &item.bundle_sha256 {
+            if !dispatch::is_sha256_hex(h) {
+                findings.push(bad(format!(
+                    "{}: bundle-sha256 '{}' is not a SHA-256 digest (illegal combination 6, §4.6)",
+                    addr_s, h
+                )));
+            }
+            // The hashes this item's attempts are known
+            // by: the record's current hash plus every
+            // assignment's. A superseded attempt's
+            // stratum copy carries its own attempt's
+            // hash — matching any filed attempt is
+            // well-formed; matching none is divergence.
+            let mut known: Vec<String> = vec![h.clone()];
+            for a in assignments.iter().filter(|a| a.item.as_deref() == Some(addr_s.as_str())) {
+                if let Some(t) = lat.px.get(&a.addr) {
+                    if let Some(ah) = lattice::field(t, "bundle-sha256") {
+                        if !known.contains(&ah) {
+                            known.push(ah);
+                        }
+                    }
+                }
+            }
+            for n in 2..=(item.attempts as usize) + 1 {
+                if let Some(doc) = lat.universe(n) {
+                    if let Some(copy) = doc.get(&item.addr) {
+                        if let Some(h2) = lattice::field(copy, "bundle-sha256") {
+                            if !known.iter().any(|k| k == &h2) {
+                                findings.push(bad(format!(
+                                    "{}: attempt universe ${}'s bundle-sha256 does not match the item record's (illegal combination 6, §4.6)",
+                                    addr_s, n
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Slice 4: combination 6 completed — for each
+        // live assignment naming this item, rebuild the
+        // canonical bundle from the attempt universe the
+        // acceptance filed and compare its digest to the
+        // record's. A stratum missing its pieces returns
+        // None (combination 7 owns absence); a stratum
+        // whose contents hash elsewhere is the finding.
+        if let Some(h) = &item.bundle_sha256 {
+            for a in assignments.iter().filter(|a| a.live && a.item.as_deref() == Some(addr_s.as_str())) {
+                if let Some(att) = a.attempt.as_deref().and_then(|s| s.parse::<u32>().ok()) {
+                    if let Some(recomputed) = crate::wire::recompute_bundle_sha256(lat, &item.addr, att) {
+                        if recomputed != *h {
+                            findings.push(bad(format!(
+                                "{}: attempt universe ${}'s contents recompute to bundle digest {}, not the record's {} (illegal combination 6, §4.6)",
+                                addr_s,
+                                att + 1,
+                                recomputed,
+                                h
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        // Terminal items: combination 1 (no receipt, or a
+        // receipt whose evidence fields are empty),
+        // combination 4 (cancelled with no note, or by an
+        // executor), and §7.2's twin (a done closure with
+        // no audit record).
+        if state.is_terminal() {
+            let term = receipts
+                .iter()
+                .filter(|r| r.item.as_deref() == Some(addr_s.as_str()) && r.to.as_deref() == Some(state.name()))
+                .last();
+            match term {
+                None => findings.push(bad(format!(
+                    "{}: terminal ({}) with no receipt (illegal combination 1, §4.6)",
+                    addr_s,
+                    state.name()
+                ))),
+                Some(r) => {
+                    let ev_empty = r.evidence.as_deref().map(|e| e.trim().is_empty()).unwrap_or(true);
+                    if ev_empty {
+                        if state == ItemState::Cancelled {
+                            findings.push(bad(format!(
+                                "{}: cancelled with no note — receipt {} carries no evidence (illegal combination 4, §4.6)",
+                                addr_s,
+                                crate::phext::fmt_coord(&r.addr)
+                            )));
+                        } else {
+                            findings.push(bad(format!(
+                                "{}: terminal receipt {} has empty evidence fields (illegal combination 1, §4.6)",
+                                addr_s,
+                                crate::phext::fmt_coord(&r.addr)
+                            )));
+                        }
+                    }
+                    if state == ItemState::Cancelled {
+                        let actor = r.actor.clone().unwrap_or_default();
+                        let actor_node = actor.split_whitespace().next().unwrap_or("");
+                        let legit = actor == "will"
+                            || actor == "emise"
+                            || actor == local_actor
+                            || (!local_node.is_empty() && actor_node == local_node);
+                        if !legit {
+                            findings.push(bad(format!(
+                                "{}: cancelled by '{}' — not Will/Emise or this node (illegal combination 4, §4.6)",
+                                addr_s, actor
+                            )));
+                        }
+                    }
+                }
+            }
+            if state == ItemState::Done {
+                // §7.2's closure audits: the coordinator's
+                // non-ping-close, and (slice 3) the register's
+                // register-close (§10.3).
+                let has_audit = audits.iter().any(|a| {
+                    (a.kind == "non-ping-close" || a.kind == "register-close")
+                        && a.item.as_deref() == Some(addr_s.as_str())
+                });
+                if !has_audit {
+                    findings.push(bad(format!(
+                        "{}: done with no audit record — a non-ping closure without one is a finding (§4.5, §7.2)",
+                        addr_s
+                    )));
+                }
+            }
+        }
+        // Illegal combination 2: an item running under two
+        // live assignments (the single-assignment invariant).
+        if state == ItemState::Running {
+            let live = assignments
+                .iter()
+                .filter(|a| a.live && a.item.as_deref() == Some(addr_s.as_str()))
+                .count();
+            if live >= 2 {
+                findings.push(bad(format!(
+                    "{}: running under {} live assignments — exactly one attempt universe is authoritative (illegal combination 2, §4.6)",
+                    addr_s, live
+                )));
+            }
+        }
+    }
+
+    // §4.5: receipts citing no live item (must be 0).
+    for r in &receipts {
+        if let Some(it) = &r.item {
+            if !item_addrs.contains(it) {
+                findings.push(Finding {
+                    item: "queue integrity".into(),
+                    ok: false,
+                    detail: format!(
+                        "receipt {} cites {}, which is not a live queue item (§4.5)",
+                        crate::phext::fmt_coord(&r.addr),
+                        it
+                    ),
+                    fixable: false,
+                });
+            }
+        }
+    }
+
+    // Slice 3 (§10.3): register-seq is the drain's dedup
+    // key — two live items carrying one seq means a drain
+    // filed the same entry atom twice, which the drain's
+    // construction forbids; the record is corrupt.
+    {
+        let mut by_seq: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+        for item in &items {
+            if let Some(seq) = &item.register_seq {
+                by_seq.entry(seq.as_str()).or_default().push(crate::phext::fmt_coord(&item.addr));
+            }
+        }
+        let mut seqs: Vec<&str> = by_seq.keys().cloned().collect();
+        seqs.sort();
+        for seq in seqs {
+            let holders = &by_seq[seq];
+            if holders.len() > 1 {
+                findings.push(Finding {
+                    item: "queue integrity".into(),
+                    ok: false,
+                    detail: format!(
+                        "register-seq {} is carried by {} items ({}) — a drain files each entry atom once (§10.3)",
+                        seq,
+                        holders.len(),
+                        holders.join(", ")
+                    ),
+                    fixable: false,
+                });
+            }
+        }
+    }
+
+    // Slice 3 (§10.4): write-backs still owed to the
+    // register — a count, visible; the drain's sweep
+    // retries them. A pending write-back is a state, not a
+    // corruption, so it never fails the doctor.
+    let wb_pending = items
+        .iter()
+        .filter(|i| i.register_writeback.as_deref() == Some("pending"))
+        .count();
+    if wb_pending > 0 {
+        findings.push(Finding {
+            item: "register write-back".into(),
+            ok: true,
+            detail: format!(
+                "{} item(s) closed locally with the register resolution not yet recorded — the next drain retries them (§10.4)",
+                wb_pending
+            ),
+            fixable: false,
+        });
+    }
+
+    // Slice 5 (§8, §4.5): the F5 path, checked. A live
+    // assignment with a stale heartbeat for an item
+    // homed HERE, still dispatched or running, with no
+    // `failure detected` receipt filed for the item, is
+    // an executor loss the path has not acted on — the
+    // doctor names it; the heartbeat verb's reconcile
+    // is the repair. An executor's own copy (its record
+    // carries `home:`) is the origin's business, never
+    // this node's finding.
+    let detected_items = kind_receipt_items(px, "failure detected");
+    for a in &assignments {
+        if !a.live {
+            continue;
+        }
+        let stale_beat = a
+            .heartbeat
+            .as_deref()
+            .and_then(crate::core::stamp_minutes)
+            .map(|m| crate::core::now_minutes() - m > 6)
+            .unwrap_or(false);
+        if !stale_beat {
+            continue;
+        }
+        let item_s = match &a.item {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        if detected_items.contains(&item_s) {
+            continue;
+        }
+        if let Some(it) = items.iter().find(|i| crate::phext::fmt_coord(&i.addr) == item_s) {
+            if it.home.is_none()
+                && matches!(it.state, Some(ItemState::Dispatched) | Some(ItemState::Running))
+            {
+                findings.push(Finding {
+                    item: "queue integrity".into(),
+                    ok: false,
+                    detail: format!(
+                        "{}: assignment {} (attempt {}) has a stale heartbeat and no failure detection on file — the executor loss is not on the F5 path (§8)",
+                        item_s,
+                        crate::phext::fmt_coord(&a.addr),
+                        a.attempt.as_deref().unwrap_or("?")
+                    ),
+                    fixable: false,
+                });
+            }
+        }
+    }
+
+    // Slice 5 (§8): the failure counter against its
+    // receipted history. The counter resets ONLY on a
+    // verified progress receipt or a manual resume, so
+    // the failures receipted since the last receipted
+    // reset are the counter's floor: a record below
+    // that floor understates its own history — a reset
+    // happened with no receipt behind it. A record
+    // above the floor is an incomplete history (older
+    // receipts gone) and stays silent: the doctor
+    // convicts on evidence, never on absence.
+    let verified_books = kind_receipt_books(px, "progress verified");
+    for item in &items {
+        let addr_s = crate::phext::fmt_coord(&item.addr);
+        let mut events: Vec<(u32, i32)> = Vec::new();
+        for r in &receipts {
+            if r.item.as_deref() != Some(addr_s.as_str()) {
+                continue;
+            }
+            let book = r.addr[5];
+            let from = r.from.as_deref().unwrap_or("");
+            let to = r.to.as_deref().unwrap_or("");
+            if (from == "running" || from == "dispatched") && (to == "queued" || to == "paused-auto") {
+                events.push((book, 1));
+            } else if (from == "paused" || from == "paused-auto") && to == "queued" {
+                events.push((book, 0));
+            }
+        }
+        for (book, it) in &verified_books {
+            if *it == addr_s {
+                events.push((*book, 0));
+            }
+        }
+        if events.is_empty() {
+            continue;
+        }
+        events.sort_by_key(|(b, _)| *b);
+        let mut implied: u32 = 0;
+        for (_, e) in &events {
+            if *e == 1 {
+                implied += 1;
+            } else {
+                implied = 0;
+            }
+        }
+        if item.failures < implied {
+            findings.push(Finding {
+                item: "queue integrity".into(),
+                ok: false,
+                detail: format!(
+                    "{}: failures: {} understates its receipted history — {} consecutive failure(s) stand since the last receipted reset (verified progress or manual resume, §8)",
+                    addr_s, item.failures, implied
+                ),
+                fixable: false,
+            });
+        }
+    }
+
+    // Assignments: counted, with stale heartbeats named as
+    // a count — the F5 path that acts on them is slice 5
+    // (§8; the per-assignment finding stands above).
+    let live = assignments.iter().filter(|a| a.live).count();
+    let now = crate::core::now_minutes();
+    let stale = assignments
+        .iter()
+        .filter(|a| {
+            a.live
+                && a.heartbeat
+                    .as_deref()
+                    .and_then(crate::core::stamp_minutes)
+                    .map(|m| now - m > 6)
+                    .unwrap_or(false)
+        })
+        .count();
+    findings.push(Finding {
+        item: "queue assignments".into(),
+        ok: true,
+        detail: format!(
+            "{} assignment(s), {} live, {} with a stale heartbeat (3 missed 2-minute beats, §15 Q5) — the F5 path acts on these since slice 5 (§8)",
+            assignments.len(),
+            live,
+            stale
+        ),
+        fixable: false,
+    });
+
+    Report { findings }
 }
 
 #[cfg(test)]
@@ -511,5 +1028,265 @@ mod tests {
         assert!(done.iter().any(|d| d.contains("peers index")), "{:?}", done);
         assert!(check_lattice(&lat).ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --------------------------------------------------------
+    // Slice 2: the queue reconciliation (§4.5) and the
+    // illegal combinations (§4.6), one fixture per rule.
+    // --------------------------------------------------------
+
+    fn queue_lat(px: crate::phext::Phext) -> Lattice {
+        let dir = std::env::temp_dir().join(format!("qexo-doctor-queue-{}", std::process::id()));
+        let mut lat = Lattice::born(dir.join("state.phext"));
+        lat.px = px;
+        lat
+    }
+
+    fn queue_px() -> crate::phext::Phext {
+        let mut px = crate::phext::Phext::new();
+        px.insert(
+            lattice::IDENTITY,
+            lattice::record(&[("name", "Test Node"), ("node", "test-node"), ("born", "now")]),
+        );
+        px.insert(
+            lattice::NODE_KEY_RECORD,
+            lattice::record(&[("kind", "node key"), ("fingerprint", "TESTFP"), ("status", "generated")]),
+        );
+        px
+    }
+
+    fn item_text(state: &str, failures: u32, extra: &[(&str, &str)]) -> String {
+        let mut t = crate::dispatch::item_record(
+            "T",
+            None,
+            None,
+            "emise",
+            "2026-11-16 07:52 UTC",
+            "test-node TESTFP",
+            "standing",
+            Some(5),
+            Some(1),
+            None,
+            None,
+        );
+        t = lattice::set_field(&t, "state", state);
+        t = lattice::set_field(&t, "failures", &failures.to_string());
+        for (k, v) in extra {
+            t = lattice::set_field(&t, k, v);
+        }
+        t
+    }
+
+    fn transition_receipt(px: &mut crate::phext::Phext, item: &str, from: &str, to: &str, actor: &str, evidence: &str) {
+        crate::core::append_receipt(
+            px,
+            "transition",
+            &[("item", item), ("from", from), ("to", to), ("actor", actor), ("evidence", evidence)],
+        );
+    }
+
+    fn flagged(report: &Report, needle: &str) -> bool {
+        report.findings.iter().any(|f| !f.ok && f.detail.contains(needle))
+    }
+
+    #[test]
+    fn queue_reconciliation_accepts_a_healthy_queue() {
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[]));
+        px.insert(crate::dispatch::item_addr(2), item_text("paused", 1, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.2/1.1.1", "queued", "paused", "test-node TESTFP", "later");
+        let report = check_queue(&queue_lat(px));
+        assert!(report.ok(), "{:?}", report.findings.iter().map(|f| &f.detail).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn queue_reconciliation_flags_each_illegal_combination() {
+        // 1 — terminal with no receipt; and done with a
+        // receipt but no audit (the §7.2 twin).
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("done", 0, &[]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 1"));
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("done", 0, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "done", "test-node TESTFP", "checked: x");
+        let report = check_queue(&queue_lat(px.clone()));
+        assert!(!flagged(&report, "illegal combination 1"), "receipted done must pass combination 1");
+        assert!(flagged(&report, "no audit record"));
+        crate::dispatch::append_audit(&mut px, "non-ping-close", "11.11.11/2.1.1/1.1.1", "c", "s", "v", "test-node TESTFP");
+        assert!(check_queue(&queue_lat(px)).ok());
+
+        // 2 — running under two live assignments.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("running", 0, &[]));
+        for b in [1, 2] {
+            px.insert(
+                lattice::at(lattice::HL_DISPATCH, [lattice::DISPATCH_ASSIGN_C, 1, b, 1, 1, 1]),
+                lattice::record(&[("item", "11.11.11/2.1.1/1.1.1"), ("attempt", "1"), ("heartbeat", "2026-11-16 07:52 UTC")]),
+            );
+        }
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 2"));
+
+        // 3 — paused-auto below the failure cap; queued at it.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("paused-auto", 1, &[]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 3"));
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 3, &[]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 3"));
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("paused-auto", 3, &[]));
+        assert!(!flagged(&check_queue(&queue_lat(px)), "illegal combination 3"));
+
+        // 4 — cancelled by another node (an executor), and
+        // cancelled with no note.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("cancelled", 0, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "queued", "cancelled", "other-node ABCD", "moot");
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 4"));
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("cancelled", 0, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "queued", "cancelled", "test-node TESTFP", "");
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 4"));
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("cancelled", 0, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "queued", "cancelled", "test-node TESTFP", "moot");
+        assert!(check_queue(&queue_lat(px)).ok());
+
+        // 5 — waiting with no register cite.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("waiting", 0, &[]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 5"));
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("waiting", 0, &[("register", "181")]));
+        assert!(check_queue(&queue_lat(px)).ok());
+
+        // 6 — a bundle-sha256 that is not a digest.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[("bundle-sha256", "xyz")]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 6"));
+
+        // 7 — attempts cited, attempt universe absent.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[("attempts", "2")]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "illegal combination 7"));
+
+        // §4.5 — a receipt citing no live item.
+        let mut px = queue_px();
+        transition_receipt(&mut px, "11.11.11/2.1.99/1.1.1", "queued", "paused", "test-node TESTFP", "later");
+        assert!(flagged(&check_queue(&queue_lat(px)), "not a live queue item"));
+
+        // An unknown state is a finding in its own right.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("sideways", 0, &[]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "is not a queue state"));
+    }
+
+    #[test]
+    fn queue_reconciliation_checks_the_register_link() {
+        // Slice 3 (§10.3): a register-born item with no
+        // register-seq is a finding; with one, it is healthy.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[("origin", "register")]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "no register-seq"));
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[("origin", "register"), ("register-seq", "7")]));
+        assert!(check_queue(&queue_lat(px)).ok());
+
+        // A register-seq carried by two items: the drain
+        // files each entry atom once, so this is corruption.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[("origin", "register"), ("register-seq", "7")]));
+        px.insert(crate::dispatch::item_addr(2), item_text("queued", 0, &[("origin", "register"), ("register-seq", "7")]));
+        assert!(flagged(&check_queue(&queue_lat(px)), "register-seq 7 is carried by 2 items"));
+
+        // A done item whose closure audit is a
+        // register-close satisfies §7.2's twin check.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("done", 0, &[("origin", "register"), ("register-seq", "7"), ("register", "42")]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "queued", "done", "test-node TESTFP", "checked: register resolution seq 4; showed: x; verdict: closed-settled");
+        crate::dispatch::append_audit(&mut px, "register-close", "11.11.11/2.1.1/1.1.1", "register resolution seq 4", "x", "closed-settled", "test-node TESTFP");
+        assert!(check_queue(&queue_lat(px)).ok());
+
+        // A pending write-back is reported as a count and
+        // never fails the doctor (§10.4).
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("cancelled", 0, &[("register", "42"), ("register-writeback", "pending")]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "queued", "cancelled", "test-node TESTFP", "moot");
+        let report = check_queue(&queue_lat(px));
+        assert!(report.ok(), "{:?}", report.findings.iter().map(|f| &f.detail).collect::<Vec<_>>());
+        assert!(report.findings.iter().any(|f| f.ok && f.item == "register write-back" && f.detail.contains("1 item(s)")));
+    }
+
+    #[test]
+    fn queue_reconciliation_honors_an_existing_attempt_universe() {
+        // Item with attempts: 1 whose attempt universe ($2)
+        // exists in the chain: no combination-7 finding.
+        let mut u1 = queue_px();
+        u1.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[("attempts", "1")]));
+        let mut u2 = crate::phext::Phext::new();
+        u2.insert(crate::dispatch::item_addr(1), item_text("running", 0, &[("attempts", "1")]));
+        let dir = std::env::temp_dir().join(format!("qexo-doctor-chain-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("state.phext");
+        let bytes = crate::phext::Phext::serialize_universes(&[u1, u2], true);
+        std::fs::write(&path, bytes).unwrap();
+        let lat = Lattice::load_from(&path).unwrap().expect("chain state loads");
+        let report = check_queue(&lat);
+        assert!(!flagged(&report, "illegal combination 7"), "{:?}", report.findings.iter().map(|f| &f.detail).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queue_reconciliation_checks_the_f5_path_and_the_counter() {
+        // Slice 5 (§8, §4.5): a stale live assignment
+        // for an item homed here, still running, with
+        // no detection on file, is flagged; filing the
+        // detection receipt clears the finding.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("running", 0, &[]));
+        px.insert(
+            lattice::at(lattice::HL_DISPATCH, [lattice::DISPATCH_ASSIGN_C, 1, 1, 1, 1, 1]),
+            lattice::record(&[("item", "11.11.11/2.1.1/1.1.1"), ("attempt", "1"), ("heartbeat", "2026-11-16 07:52 UTC")]),
+        );
+        assert!(flagged(&check_queue(&queue_lat(px.clone())), "not on the F5 path"));
+        crate::core::append_receipt(
+            &mut px,
+            "failure detected",
+            &[("item", "11.11.11/2.1.1/1.1.1"), ("attempt", "1"), ("node", "beta"), ("evidence", "test")],
+        );
+        assert!(!flagged(&check_queue(&queue_lat(px)), "not on the F5 path"));
+
+        // The counter against its history (§8): two
+        // receipted failures, no receipted reset — a
+        // record claiming failures: 1 understates them.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 1, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "queued", "test-node TESTFP", "boom 1");
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "queued", "test-node TESTFP", "boom 2");
+        assert!(flagged(&check_queue(&queue_lat(px.clone())), "understates its receipted history"));
+        // A record that owns its history is silent.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 2, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "queued", "test-node TESTFP", "boom 1");
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "queued", "test-node TESTFP", "boom 2");
+        assert!(!flagged(&check_queue(&queue_lat(px)), "understates its receipted history"));
+        // A verified progress receipt between the
+        // failures resets the floor (§8).
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 1, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "queued", "test-node TESTFP", "boom 1");
+        crate::core::append_receipt(
+            &mut px,
+            "progress verified",
+            &[("item", "11.11.11/2.1.1/1.1.1"), ("attempt", "2"), ("checkpoint", "$3:11.11.11/2.1.1/1.1.4"), ("failures", "1 -> 0")],
+        );
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "queued", "test-node TESTFP", "boom 2");
+        assert!(!flagged(&check_queue(&queue_lat(px)), "understates its receipted history"));
+        // A manual resume resets it too.
+        let mut px = queue_px();
+        px.insert(crate::dispatch::item_addr(1), item_text("queued", 0, &[]));
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "running", "paused-auto", "test-node TESTFP", "boom 3");
+        transition_receipt(&mut px, "11.11.11/2.1.1/1.1.1", "paused-auto", "queued", "test-node TESTFP", "manual resume");
+        assert!(!flagged(&check_queue(&queue_lat(px)), "understates its receipted history"));
     }
 }

@@ -26,6 +26,19 @@ pub enum Command {
     Release,
     Update { check: bool },
     Evolve { check: bool },
+    Enqueue { args: Vec<String>, app: bool },
+    Queue { all: bool, node: Option<String>, explain: Option<String>, app: bool },
+    Pause { args: Vec<String>, app: bool },
+    Resume { args: Vec<String>, app: bool },
+    Cancel(Vec<String>),
+    Audit { args: Vec<String>, app: bool },
+    Bridge { args: Vec<String>, write: bool },
+    Drain { check: bool, url: Option<String>, app: bool },
+    Dispatch { item: Option<String>, to: Option<String>, check: bool, app: bool },
+    Heartbeat(String),
+    Checkpoint(Vec<String>),
+    Fail(Vec<String>),
+    Show { addr: String, app: bool },
     Host { persona: Option<String>, boot: Option<String> },
     Unhost(String),
     Message { persona: String, text: String },
@@ -38,6 +51,13 @@ pub enum Command {
 
 pub fn parse(args: &[String]) -> Command {
     let w = |i: usize| args.get(i).map(|s| s.as_str()).unwrap_or("");
+    // `--app` (slice 7, spec §2.3): the verb's app-surface
+    // form. It is stripped from the verb's own tail — the
+    // session it opens speaks for the whole dispatch set.
+    let strip_app = |tail: &[String]| -> (Vec<String>, bool) {
+        let app = tail.iter().any(|a| a == "--app");
+        (tail.iter().filter(|a| *a != "--app").cloned().collect(), app)
+    };
     match w(0) {
         "" => Command::Bare,
         "--help" | "-h" | "help" => Command::Help,
@@ -104,6 +124,95 @@ pub fn parse(args: &[String]) -> Command {
             }
         }
         "register" => Command::Register(args[1..].to_vec()),
+        "enqueue" => {
+            let (tail, app) = strip_app(&args[1..]);
+            Command::Enqueue { args: tail, app }
+        }
+        "queue" => {
+            let mut node: Option<String> = None;
+            let mut explain: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--node" && i + 1 < args.len() {
+                    node = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--explain" && i + 1 < args.len() {
+                    explain = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Command::Queue {
+                all: args.iter().any(|a| a == "--all"),
+                node,
+                explain,
+                app: args.iter().any(|a| a == "--app"),
+            }
+        }
+        "pause" => {
+            let (tail, app) = strip_app(&args[1..]);
+            Command::Pause { args: tail, app }
+        }
+        "resume" => {
+            let (tail, app) = strip_app(&args[1..]);
+            Command::Resume { args: tail, app }
+        }
+        "cancel" => Command::Cancel(args[1..].to_vec()),
+        "audit" => {
+            let (tail, app) = strip_app(&args[1..]);
+            Command::Audit { args: tail, app }
+        }
+        "bridge" => Command::Bridge {
+            write: args.iter().any(|a| a == "--add" || a == "--check" || a == "--retire"),
+            args: args[1..].to_vec(),
+        },
+        "drain" => {
+            let mut url: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--url" && i + 1 < args.len() {
+                    url = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Command::Drain { check: args.iter().any(|a| a == "--check"), url, app: args.iter().any(|a| a == "--app") }
+        }
+        "dispatch" => {
+            let mut item: Option<String> = None;
+            let mut to: Option<String> = None;
+            let mut check = false;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--to" if i + 1 < args.len() => {
+                        to = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--check" => {
+                        check = true;
+                        i += 1;
+                    }
+                    other if !other.starts_with("--") && item.is_none() => {
+                        item = Some(other.to_string());
+                        i += 1;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            Command::Dispatch { item, to, check, app: args.iter().any(|a| a == "--app") }
+        }
+        "heartbeat" => Command::Heartbeat(args.get(1).cloned().unwrap_or_default()),
+        "checkpoint" => Command::Checkpoint(args[1..].to_vec()),
+        "fail" => Command::Fail(args[1..].to_vec()),
+        "show" => {
+            let addr = args[1..].iter().find(|a| *a != "--app").cloned().unwrap_or_default();
+            Command::Show { addr, app: args.iter().any(|a| a == "--app") }
+        }
         "release" => Command::Release,
         "update" => Command::Update { check: args.iter().any(|a| a == "--check") },
         "evolve" => Command::Evolve { check: args.iter().any(|a| a == "--check") },
@@ -138,7 +247,8 @@ pub fn parse(args: &[String]) -> Command {
 
 pub fn help_text() -> String {
     let mut s = String::new();
-    s.push_str("qexo v1.4.0 — the Exocortex coordinator (phext-native)\n");
+    s.push_str(&format!("qexo {} — the Exocortex coordinator (phext-native)
+", crate::plan::PLAN_VERSION));
     s.push_str("All node state lives in one phext file, found by resolution:\n");
     s.push_str("QEXO_STATE when set; else the system state /var/lib/qexo/state.phext when it\n");
     s.push_str("exists and is readable; else the per-user state ~/.qexo/state.phext (Windows:\n");
@@ -208,6 +318,108 @@ pub fn help_text() -> String {
     s.push_str("  qexo evolve --check       the same pass as reads only — print what would change, write nothing\n");
     s.push_str("                            (update is one stage of evolve: with evolve: on in the config record,\n");
     s.push_str("                            the automatic timer fires `qexo evolve` instead of `qexo update`)\n\n");
+
+    s.push_str("Dispatch (the dispatch core):\n");
+    s.push_str("  qexo enqueue <brief-file> [--title <t>] [--coordinate <task-coordinate>] [--register <n>]\n");
+    s.push_str("                            [--value <1-9>] [--cost <1-9>] [--goal <text>] [--after <item-address>]\n");
+    s.push_str("                            [--exit <text>] [--origin <origin>]\n");
+    s.push_str("                            file a queue item in the dispatch homeland (11.11.11/11.11.11/11.11.11,\n");
+    s.push_str("                            cluster 2): the item record at Scroll 1, the brief at Scroll 2.\n");
+    s.push_str("                            Prints the item's full address only after the record is durable\n");
+    s.push_str("                            in state (write-before-ack). `qexo enqueue -` reads the brief\n");
+    s.push_str("                            from stdin\n");
+    s.push_str("  qexo queue [--all] [--node <name>]\n");
+    s.push_str("                            the queue in its calculated order (spec §5: daily-goal class,\n");
+    s.push_str("                            then ROI ratio, then age — calculated at every read, never\n");
+    s.push_str("                            stored): state, title, sort keys, age, failures. Paused-auto\n");
+    s.push_str("                            items pin to the head, flagged. --all includes terminal items\n");
+    s.push_str("                            (done, cancelled)\n");
+    s.push_str("  qexo queue --explain <item-address>\n");
+    s.push_str("                            one item's sort keys, its calculated position, and its\n");
+    s.push_str("                            re-order audit trail\n");
+    s.push_str("  qexo pause <item-address> [--note <text>]\n");
+    s.push_str("                            manual pause: the item leaves the dispatchable queue until\n");
+    s.push_str("                            resumed. The transition and its receipt are one write\n");
+    s.push_str("  qexo resume <item-address>\n");
+    s.push_str("                            return a paused item to queued; also the manual override of\n");
+    s.push_str("                            an auto-pause (resets the consecutive-failure counter, and\n");
+    s.push_str("                            writes the audit that says who overrode)\n");
+    s.push_str("  qexo cancel <item-address> --note <text>\n");
+    s.push_str("                            terminal, Will/Emise only, note required — the note is the\n");
+    s.push_str("                            receipt's evidence\n");
+    s.push_str("  qexo drain [--check] [--url <register-url>]\n");
+    s.push_str("                            the register drain (spec §10): pull the pending entries\n");
+    s.push_str("                            and resolutions of Will's scope from the register, file\n");
+    s.push_str("                            entries as queue items, close the items resolutions name\n");
+    s.push_str("                            (register-close audits), retry pending write-backs, and\n");
+    s.push_str("                            advance the watermarks — items and audits land before\n");
+    s.push_str("                            watermarks move (write-before-ack), so a re-drain is a\n");
+    s.push_str("                            no-op. --check reports what a drain would do; writes\n");
+    s.push_str("                            nothing. --url names the register once; it is kept in\n");
+    s.push_str("                            the drain record (11.11.11/6.1.1/1.1.1). Credentials live\n");
+    s.push_str("                            in /var/lib/qexo/qexo.env (QEXO_ENV overrides the path),\n");
+    s.push_str("                            never in state\n");
+    s.push_str("  qexo audit [--item <address>] [--kind <kind>] [--since <date>]\n");
+    s.push_str("                            the audit view (ledgers, cluster 9): what was checked and why\n");
+    s.push_str("                            an act was allowed to happen quietly — newest last.\n");
+    s.push_str("                            `qexo audit show <address>` renders one audit in full\n");
+    s.push_str("  qexo dispatch [<item-address>] [--to <node>] [--check]\n");
+    s.push_str("                            place the queue's head (or the named item) on a node drawn\n");
+    s.push_str("                            fairly from the eligible set (spec §6: reachable, load/thermal\n");
+    s.push_str("                            gates, no resident displaced, inputs stageable, capability fit),\n");
+    s.push_str("                            as a signed bundle (spec §3.4) the target accepts or refuses with\n");
+    s.push_str("                            a receipt. The placement receipt is the assignment record\n");
+    s.push_str("                            (11.11.11, cluster 3). An empty eligible set is a receipted\n");
+    s.push_str("                            outcome — the item stays queued; nothing defaults to the\n");
+    s.push_str("                            coordinator. --check prints the round and writes nothing\n");
+    s.push_str("  qexo heartbeat <item-address>\n");
+    s.push_str("                            on the executing node: beat — the heartbeat line lands on the\n");
+    s.push_str("                            assignment and the attempt record; the first beat moves the\n");
+    s.push_str("                            item dispatched → running. On the item's home node: read the\n");
+    s.push_str("                            executor's assignment over the scroll route and reconcile —\n");
+    s.push_str("                            new checkpoint cites are taken into custody and their cited\n");
+    s.push_str("                            outputs verified by read-back (verified progress resets the\n");
+    s.push_str("                            failure counter, §8); on 3 missed beats with the executor\n");
+    s.push_str("                            unreachable or silent, the failure is detected and the item\n");
+    s.push_str("                            teleports to a fresh fair draw, resuming from its last\n");
+    s.push_str("                            checkpoint (the third consecutive failure auto-pauses instead)\n");
+    s.push_str("  qexo checkpoint <item-address> --note <text> [--output <coordinate>]...\n");
+    s.push_str("                            append a checkpoint scroll (Scroll 4+) in the attempt universe's\n");
+    s.push_str("                            item Book and cite it on the assignment; each --output names a\n");
+    s.push_str("                            scroll this attempt produced — its SHA-256 is recorded beside\n");
+    s.push_str("                            the cite, the pair the origin verifies progress against (§8)\n");
+    s.push_str("  qexo fail <item-address> --note <evidence>\n");
+    s.push_str("                            the executor's failure receipt: the item returns to queued (the\n");
+    s.push_str("                            third consecutive failure auto-pauses it) and the assignment\n");
+    s.push_str("                            retires with the evidence as its status\n");
+    s.push_str("  qexo bridge [--add <name> --kind <kind> --endpoint <where> [--capability <text>]...\n");
+    s.push_str("                            [--burn metered|never] [--reset <text>] [--freshness <seconds>]]\n");
+    s.push_str("                            [--check [<name>]] [--retire <name>]\n");
+    s.push_str("                            the bridge registry (spec §9: dispatch homeland cluster 5,\n");
+    s.push_str("                            records from 11.11.11/5.1.1/1.1.1):\n");
+    s.push_str("                            durable, health-checked routes to inference sources. Bare\n");
+    s.push_str("                            `qexo bridge` lists the registry with health calculated from\n");
+    s.push_str("                            each Book's health log — a bridge is live iff its latest probe\n");
+    s.push_str("                            succeeded within its freshness window; health is never a stored\n");
+    s.push_str("                            field. --check probes now and appends the evidence. An item whose\n");
+    s.push_str("                            brief names `bridge:` preferences routes only over a bridge\n");
+    s.push_str("                            verified live for that dispatch; failovers are receipts, and a\n");
+    s.push_str("                            `burn: never` bridge never routes work (enqueue refuses a brief\n");
+    s.push_str("                            that names one). Kinds: claude | grok | chatgpt | ollama | tlm |\n");
+    s.push_str("                            slm | llm | sq | custom — the model line is first-class from day one\n");
+    s.push_str("  qexo show <address>       render one record from this node's state; the address may carry\n");
+    s.push_str("                            a universe prefix — $2:11.11.11/2.1.1/1.1.1 reads universe 2 of\n");
+    s.push_str("                            the state chain (a bare address is universe 1)\n");
+    s.push_str("  qexo <verb> --app         the dispatch verbs as a line protocol for front-ends (the Android\n");
+    s.push_str("                            launcher): enqueue --app, queue --app, dispatch --app, show --app,\n");
+    s.push_str("                            pause --app, resume --app, audit --app, drain --app — every spelling\n");
+    s.push_str("                            opens the same session over the same queue state machine, the learn\n");
+    s.push_str("                            --app pattern: one command per line (enqueue / queue / dispatch /\n");
+    s.push_str("                            show / pause / resume / audit / drain / quit), replies as key: value\n");
+    s.push_str("                            lines, each block closed by end: <command>, a greeting block at\n");
+    s.push_str("                            start. Bare `enqueue` in the session pastes the brief: lines until\n");
+    s.push_str("                            a line containing only '.' (a line '..' unstuffs to '.'). cancel\n");
+    s.push_str("                            has no --app form — it stays a CLI act\n\n");
 
     s.push_str("Personas & inference:\n");
     s.push_str("  qexo host <persona>       load a persona into local inference (--boot <path> for a boot text file;\n");
@@ -282,6 +494,39 @@ mod tests {
         assert_eq!(parse(&v(&["inventory", "sq"])), Command::Inventory { name: Some("sq".into()), install: None });
         assert_eq!(parse(&v(&["inventory", "--install", "sq"])), Command::Inventory { name: None, install: Some("sq".into()) });
         assert_eq!(parse(&v(&["register", "keyfile.asc"])), Command::Register(v(&["keyfile.asc"])));
+        assert_eq!(parse(&v(&["enqueue", "brief.md", "--title", "T"])), Command::Enqueue { args: v(&["brief.md", "--title", "T"]), app: false });
+        assert_eq!(parse(&v(&["enqueue", "-"])), Command::Enqueue { args: v(&["-"]), app: false });
+        assert_eq!(parse(&v(&["queue"])), Command::Queue { all: false, node: None, explain: None, app: false });
+        assert_eq!(parse(&v(&["queue", "--all"])), Command::Queue { all: true, node: None, explain: None, app: false });
+        assert_eq!(parse(&v(&["queue", "--node", "aletheia-core"])), Command::Queue { all: false, node: Some("aletheia-core".into()), explain: None, app: false });
+        assert_eq!(
+            parse(&v(&["queue", "--explain", "11.11.11/2.1.4/1.1.1"])),
+            Command::Queue { all: false, node: None, explain: Some("11.11.11/2.1.4/1.1.1".into()), app: false }
+        );
+        assert_eq!(parse(&v(&["pause", "11.11.11/2.1.4/1.1.1"])), Command::Pause { args: v(&["11.11.11/2.1.4/1.1.1"]), app: false });
+        assert_eq!(parse(&v(&["pause", "11.11.11/2.1.4/1.1.1", "--note", "later"])), Command::Pause { args: v(&["11.11.11/2.1.4/1.1.1", "--note", "later"]), app: false });
+        assert_eq!(parse(&v(&["resume", "11.11.11/2.1.4/1.1.1"])), Command::Resume { args: v(&["11.11.11/2.1.4/1.1.1"]), app: false });
+        assert_eq!(parse(&v(&["cancel", "11.11.11/2.1.4/1.1.1", "--note", "moot"])), Command::Cancel(v(&["11.11.11/2.1.4/1.1.1", "--note", "moot"])));
+        assert_eq!(parse(&v(&["drain"])), Command::Drain { check: false, url: None, app: false });
+        assert_eq!(parse(&v(&["drain", "--check"])), Command::Drain { check: true, url: None, app: false });
+        assert_eq!(
+            parse(&v(&["drain", "--url", "https://register.phext.io"])),
+            Command::Drain { check: false, url: Some("https://register.phext.io".into()), app: false }
+        );
+        assert_eq!(
+            parse(&v(&["drain", "--check", "--url", "http://127.0.0.1:8791"])),
+            Command::Drain { check: true, url: Some("http://127.0.0.1:8791".into()), app: false }
+        );
+        assert_eq!(parse(&v(&["bridge"])), Command::Bridge { args: v(&[]), write: false });
+        assert_eq!(
+            parse(&v(&["bridge", "--add", "claude", "--kind", "claude", "--endpoint", "https://claude.example", "--burn", "never"])),
+            Command::Bridge { args: v(&["--add", "claude", "--kind", "claude", "--endpoint", "https://claude.example", "--burn", "never"]), write: true }
+        );
+        assert_eq!(parse(&v(&["bridge", "--check", "claude"])), Command::Bridge { args: v(&["--check", "claude"]), write: true });
+        assert_eq!(parse(&v(&["audit"])), Command::Audit { args: v(&[]), app: false });
+        assert_eq!(parse(&v(&["audit", "show", "6.6.6/9.1.1/1.1.1"])), Command::Audit { args: v(&["show", "6.6.6/9.1.1/1.1.1"]), app: false });
+        assert_eq!(parse(&v(&["show", "11.11.11/2.1.4/1.1.1"])), Command::Show { addr: "11.11.11/2.1.4/1.1.1".into(), app: false });
+        assert_eq!(parse(&v(&["show", "$2:11.11.11/2.1.4/1.1.1"])), Command::Show { addr: "$2:11.11.11/2.1.4/1.1.1".into(), app: false });
         assert_eq!(parse(&v(&["host"])), Command::Host { persona: None, boot: None });
         assert_eq!(
             parse(&v(&["host", "Emise", "--boot", "emise.phext"])),
@@ -299,6 +544,20 @@ mod tests {
         assert_eq!(parse(&v(&["wiring-check"])), Command::WiringCheck(None));
         assert_eq!(parse(&v(&["select", "f.phext", "1.1.1/1.1.1/1.1.1"])), Command::FileOp(v(&["select", "f.phext", "1.1.1/1.1.1/1.1.1"])));
         assert_eq!(parse(&v(&["frobnicate"])), Command::Unknown("frobnicate".into()));
+        // Slice 7 (§2.3): every dispatch verb's --app form —
+        // the flag is the session's door, stripped from the tail.
+        assert_eq!(parse(&v(&["enqueue", "--app"])), Command::Enqueue { args: v(&[]), app: true });
+        assert_eq!(parse(&v(&["enqueue", "brief.md", "--app"])), Command::Enqueue { args: v(&["brief.md"]), app: true });
+        assert_eq!(parse(&v(&["queue", "--app"])), Command::Queue { all: false, node: None, explain: None, app: true });
+        assert_eq!(parse(&v(&["dispatch", "--app"])), Command::Dispatch { item: None, to: None, check: false, app: true });
+        assert_eq!(parse(&v(&["dispatch", "--check", "--app"])), Command::Dispatch { item: None, to: None, check: true, app: true });
+        assert_eq!(parse(&v(&["show", "11.11.11/2.1.4/1.1.1", "--app"])), Command::Show { addr: "11.11.11/2.1.4/1.1.1".into(), app: true });
+        assert_eq!(parse(&v(&["show", "--app", "11.11.11/2.1.4/1.1.1"])), Command::Show { addr: "11.11.11/2.1.4/1.1.1".into(), app: true });
+        assert_eq!(parse(&v(&["pause", "11.11.11/2.1.4/1.1.1", "--app"])), Command::Pause { args: v(&["11.11.11/2.1.4/1.1.1"]), app: true });
+        assert_eq!(parse(&v(&["resume", "11.11.11/2.1.4/1.1.1", "--app"])), Command::Resume { args: v(&["11.11.11/2.1.4/1.1.1"]), app: true });
+        assert_eq!(parse(&v(&["audit", "--app"])), Command::Audit { args: v(&[]), app: true });
+        assert_eq!(parse(&v(&["drain", "--app"])), Command::Drain { check: false, url: None, app: true });
+        assert_eq!(parse(&v(&["drain", "--check", "--app"])), Command::Drain { check: true, url: None, app: true });
     }
 
     #[test]
@@ -312,12 +571,25 @@ mod tests {
     }
 
     #[test]
+    fn help_banner_names_the_build_version() {
+        // v1.7.2: the banner derives from the build, not a literal —
+        // its first line names the current PLAN_VERSION.
+        let h = help_text();
+        let first = h.lines().next().unwrap_or_default();
+        assert_eq!(first, format!("qexo {} — the Exocortex coordinator (phext-native)", crate::plan::PLAN_VERSION));
+    }
+
+    #[test]
     fn help_lists_every_command() {
         let h = help_text();
         for word in [
             "config", "doctor", "list", "register", "release", "update", "evolve", "host", "unhost", "message", "status",
             "plan", "serve", "wiring-check", "parse", "explode", "implode", "seal", "unseal", "distributed-builds",
             "select", "get", "--help", "/var/lib/qexo/state.phext", "learn", "inventory", "~/.qexo/state.phext",
+            "enqueue", "queue", "show", "11.11.11/11.11.11/11.11.11",
+            "pause", "resume", "cancel", "audit", "--explain", "drain", "11.11.11/6.1.1/1.1.1", "qexo.env",
+            "bridge", "burn: never", "11.11.11/5.1.1/1.1.1",
+            "--app", "end: <command>", "launcher",
         ] {
             assert!(h.contains(word), "help is missing {}", word);
         }
