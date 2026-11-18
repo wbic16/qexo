@@ -1,5 +1,23 @@
 # qexo changelog — the scratch line
 
+## 1.7.3 (v1.7.3) — twin sync: the dispatch core, whole, 2026-11-17
+
+**This tree catches up to wbic16/quarterexo in one sync.**
+Everything the dispatch core built there across slices 1–7
+stands here now at the same platform stamp: the chain state
+and the local queue with its transition oracle (slices
+1–2), the register integration and the scoped drain (slice
+3), wire dispatch with fair placement (slice 4), F5
+resume/teleport (slice 5), the F6 bridge registry (slice
+6), and the --app drivers every §2.1 dispatch verb speaks
+(slice 7) — the surface the Android launcher's quick
+actions drive. The one Android delta this tree carries,
+the update timer's honest report in src/core.rs (no
+systemd on Android — run qexo from Termux), is preserved
+verbatim. Per-repo documents stay per-repo: this changelog
+and the ship notes record the sync in the twin's own
+voice; the engineering record lives in quarterexo.
+
 ## 1.7.0 (v1.7.0) — distributed builds join the surface, 2026-11-15
 
 **A node upgrades itself into the compile cluster.** The fleet's

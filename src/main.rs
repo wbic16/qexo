@@ -5,12 +5,18 @@
 //! (infer), the plan's pure core (plan), doctor's two layers
 //! (doctor), the distributed-builds upgrade (distbuilds),
 //! the state lattice and its Layer 2 addressing
-//! (lattice), the state commands (core), the wiring gate
-//! (wiring), and this CLI.
+//! (lattice), the state commands (core), the dispatch
+//! queue's local verbs (dispatch), the register link
+//! (register), the wire dispatch verbs (wire), the
+//! inference bridges (bridge), the dispatch app surface
+//! (app), the wiring gate (wiring), and this CLI.
 
+mod app;
+mod bridge;
 mod cli;
 mod core;
 mod crypto;
+mod dispatch;
 mod distbuilds;
 mod doctor;
 #[allow(dead_code)]
@@ -21,6 +27,8 @@ mod lattice;
 mod learn;
 mod phext;
 mod plan;
+mod register;
+mod wire;
 mod wiring;
 mod xz;
 
@@ -62,9 +70,39 @@ fn run(cmd: Command, args: &[String]) -> i32 {
             | Command::Update { check: false }
             | Command::Evolve { check: false }
             | Command::Doctor { fix: true }
+            | Command::Enqueue { .. }
+            | Command::Bridge { write: true, .. }
+            | Command::Pause { .. }
+            | Command::Resume { .. }
+            | Command::Cancel(_)
+            | Command::Drain { check: false, .. }
+            | Command::Dispatch { check: false, .. }
+            | Command::Heartbeat(_)
+            | Command::Checkpoint(_)
+            | Command::Fail(_)
     );
     if write_intent {
         lattice::set_write_intent();
+    }
+    // The app surface (slice 7, spec §2.3): any dispatch
+    // verb's --app form opens the one app session — a
+    // session can write (its commands include enqueue and
+    // pause), so it is write-intending whichever spelling
+    // opened it.
+    let app_form = matches!(
+        cmd,
+        Command::Enqueue { app: true, .. }
+            | Command::Queue { app: true, .. }
+            | Command::Dispatch { app: true, .. }
+            | Command::Show { app: true, .. }
+            | Command::Pause { app: true, .. }
+            | Command::Resume { app: true, .. }
+            | Command::Audit { app: true, .. }
+            | Command::Drain { app: true, .. }
+    );
+    if app_form {
+        lattice::set_write_intent();
+        return app::app_session();
     }
     match cmd {
         Command::Help => {
@@ -72,7 +110,7 @@ fn run(cmd: Command, args: &[String]) -> i32 {
             0
         }
         Command::Version => {
-            println!("qexo v1.7.0 (Cargo 1.7.0)");
+            println!("qexo {} (Cargo {})", plan::PLAN_VERSION, plan::VERSION);
             0
         }
         Command::WiringCheck(dir) => {
@@ -123,6 +161,7 @@ fn run(cmd: Command, args: &[String]) -> i32 {
             let mut report = doctor::check(&dir, &file);
             if let Ok(Some(lat)) = lattice::Lattice::load() {
                 report.findings.extend(doctor::check_lattice(&lat).findings);
+                report.findings.extend(doctor::check_queue(&lat).findings);
             }
             print!("{}", report.render());
             if report.ok() { 0 } else { 1 }
@@ -146,6 +185,26 @@ fn run(cmd: Command, args: &[String]) -> i32 {
             distbuilds::distributed_builds(scheduler, status, branch)
         }
         Command::Register(args) => core::register(&args),
+        Command::Enqueue { args, .. } => dispatch::enqueue(&args),
+        Command::Queue { all, node, explain, .. } => dispatch::queue(all, node, explain),
+        Command::Pause { args, .. } => dispatch::pause(&args),
+        Command::Resume { args, .. } => dispatch::resume(&args),
+        Command::Cancel(args) => dispatch::cancel(&args),
+        Command::Drain { check, url, .. } => register::drain(check, url),
+        Command::Dispatch { item, to, check, .. } => wire::cmd_dispatch(item.as_deref(), to.as_deref(), check),
+        Command::Heartbeat(addr) => {
+            if addr.is_empty() {
+                eprintln!("usage: qexo heartbeat <item-address>");
+                2
+            } else {
+                wire::cmd_heartbeat(&addr)
+            }
+        }
+        Command::Checkpoint(args) => wire::cmd_checkpoint(&args),
+        Command::Fail(args) => wire::cmd_fail(&args),
+        Command::Audit { args, .. } => dispatch::audit(&args),
+        Command::Bridge { args, .. } => bridge::cmd_bridge(&args),
+        Command::Show { addr, .. } => dispatch::show(&addr),
         Command::Release => core::release(),
         Command::Update { check } => core::update(check),
         Command::Evolve { check } => core::evolve(check),
@@ -264,8 +323,31 @@ fn phext_file_ops(args: &[String]) -> i32 {
                     return 2;
                 }
             };
-            let px = phext::Phext::parse(&text);
-            match phext::parse_coord(&coord_s).and_then(|c| px.get(&c)) {
+            // The address may carry a universe prefix ($N:,
+            // libphext 0.6 multiverse addressing): a bare
+            // address reads the file exactly as it always has
+            // (a single-phext read — chain bytes are content);
+            // a $N: address reads universe N of the file's
+            // chain.
+            let (universe, coord) = match phext::parse_universe_addr(&coord_s) {
+                Some(x) => x,
+                None => {
+                    eprintln!("no scroll at {}", coord_s);
+                    return 1;
+                }
+            };
+            let px = if universe == 1 && !coord_s.starts_with('$') {
+                phext::Phext::parse(&text)
+            } else {
+                let (mut universes, _) = phext::Phext::parse_universes(&text);
+                if universe >= 1 && universe <= universes.len() {
+                    universes.swap_remove(universe - 1)
+                } else {
+                    eprintln!("{}: no universe ${} in its chain", path, universe);
+                    return 1;
+                }
+            };
+            match px.get(&coord) {
                 Some(body) => {
                     print!("{}", body);
                     0

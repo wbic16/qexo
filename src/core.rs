@@ -61,6 +61,51 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Parse a record timestamp to epoch minutes. Two shapes are
+/// accepted: the house stamp `now_stamp` writes
+/// ("YYYY-MM-DD HH:MM UTC") and the spec's ISO form
+/// ("YYYY-MM-DDTHH:MM:SS±HH:MM", or trailing Z). Anything else
+/// is None — a foreign timestamp qexo cannot reckon is data it
+/// reports, never a value it invents.
+pub(crate) fn stamp_minutes(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, time, offset): (&str, &str, i64) = if let Some(rest) = s.strip_suffix(" UTC") {
+        let (d, t) = rest.split_once(' ')?;
+        (d, t, 0)
+    } else if let Some((d, rest)) = s.split_once('T') {
+        if let Some(t) = rest.strip_suffix('Z') {
+            (d, t, 0)
+        } else if let Some(idx) = rest.rfind(['+', '-']) {
+            let (t, off) = rest.split_at(idx);
+            let sign: i64 = if rest.as_bytes()[idx] == b'-' { -1 } else { 1 };
+            let (oh, om) = off[1..].split_once(':')?;
+            (d, t, sign * (oh.parse::<i64>().ok()? * 60 + om.parse::<i64>().ok()?))
+        } else {
+            (d, rest, 0)
+        }
+    } else {
+        return None;
+    };
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let m: i64 = dp.next()?.parse().ok()?;
+    let d: i64 = dp.next()?.parse().ok()?;
+    let mut tp = time.split(':');
+    let hh: i64 = tp.next()?.parse().ok()?;
+    let mm: i64 = tp.next()?.parse().ok()?;
+    Some(crate::plan::days_from_civil(y, m, d) * 1440 + hh * 60 + mm - offset)
+}
+
+/// Epoch minutes right now (the same reckoning stamp_minutes
+/// parses back).
+pub(crate) fn now_minutes() -> i64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    secs.div_euclid(60)
+}
+
 pub(crate) fn require_born() -> Result<Lattice, i32> {
     match Lattice::load() {
         Ok(Some(lat)) => Ok(lat),
@@ -80,8 +125,11 @@ pub(crate) fn require_born() -> Result<Lattice, i32> {
 
 /// Append a receipt scroll to the receipts run (6.6.6/6.6.6/6.6.6 homeland, cluster 2)
 /// and return its coordinate. Receipts cite what they record by
-/// coordinate, in prose, per Layer 2.
-fn append_receipt(px: &mut Phext, action: &str, extra: &[(&str, &str)]) -> crate::phext::Coord {
+/// coordinate, in prose, per Layer 2. Crate-visible since the
+/// dispatch core (slice 2): a queue transition and its receipt
+/// are one write (spec §4.2), and the transition engine lives
+/// in dispatch.rs.
+pub(crate) fn append_receipt(px: &mut Phext, action: &str, extra: &[(&str, &str)]) -> crate::phext::Coord {
     let b = lattice::next_free_book(px, [6, 6, 6, lattice::LEDGER_RECEIPTS, 1], 1);
     let addr = lattice::at(lattice::HL_LEDGERS, [lattice::LEDGER_RECEIPTS, 1, b, 1, 1, 1]);
     let (_, stamp) = now_stamp();
@@ -1756,7 +1804,7 @@ pub fn message(persona: &str, text: &str) -> i32 {
 
 pub fn status() -> i32 {
     let path = lattice::state_path();
-    println!("qexo v1.4.0 — node status");
+    println!("qexo {} — node status", plan::PLAN_VERSION);
     println!("state: {}", path.display());
     let lat = match Lattice::load() {
         Ok(Some(l)) => l,
@@ -1811,7 +1859,8 @@ pub fn status() -> i32 {
     println!("hosted: {}", if hosted.is_empty() { "none".to_string() } else { hosted.join(", ") });
     let fs_report = doctor::check(&lattice::state_dir(), &path);
     let lat_report = doctor::check_lattice(&lat);
-    let problems = fs_report.problems() + lat_report.problems();
+    let queue_report = doctor::check_queue(&lat);
+    let problems = fs_report.problems() + lat_report.problems() + queue_report.problems();
     println!("doctor: {}", if problems == 0 { "ok".to_string() } else { format!("{} problem(s)", problems) });
     0
 }
@@ -2032,6 +2081,15 @@ pub fn plan_cmd() -> i32 {
         volume: probe.volume.clone(),
         files_root: staging_root_s.clone(),
         config: gate_cfg,
+        // v1.7.3 fair draw: the roster is the node's configured
+        // eligible set (config key `ranch_roster`); the seed is
+        // this plan's wall-clock draw seed, receipted in the
+        // plan record below.
+        roster: plan::parse_roster(lattice::field(&cfg, "ranch_roster")),
+        draw_seed: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
     };
     let (day, stamp) = now_stamp();
     let (y, m, d) = civil_from_days(day);
@@ -2048,6 +2106,21 @@ pub fn plan_cmd() -> i32 {
         .map(|v| (v.total_bytes.to_string(), v.free_bytes.to_string()))
         .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
+    // Slice 4 (§6): temperature joins the observation
+    // as a probe field, with load and cores beside it —
+    // placement eligibility is judged from telemetry,
+    // never assumed. An unreadable probe records empty,
+    // which eligibility reads as unmeasured.
+    let temp_s = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|m| format!("{:.1}", m as f64 / 1000.0))
+        .unwrap_or_default();
+    let load_s = format!("{:.2}", plan::host_snapshot().1);
+    let cores_s = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_default();
+
     // Record the observation in the telemetry homeland: the
     // series is native now; the forecast reads its own lattice.
     let ob = lattice::next_free_book(&lat.px, [8, 8, 8, lattice::TELEM_DISK_C, 1], 1);
@@ -2061,6 +2134,9 @@ pub fn plan_cmd() -> i32 {
             ("used_gb", &format!("{:.2}", used_gb)),
             ("total_bytes", &total_bytes),
             ("free_bytes", &free_bytes),
+            ("temp", &temp_s),
+            ("load", &load_s),
+            ("cores", &cores_s),
             ("level", &level),
             ("files", &files.to_string()),
             ("files root", &staging_root_s),
@@ -2094,6 +2170,11 @@ pub fn plan_cmd() -> i32 {
     let mut data = plan::compute(&tasks, &current, &history, host, &gate_inputs);
     data.disk_date = format!("{:04}-{:02}-{:02}", y, m, d);
     let rendered = plan::render(&data);
+    let draw_receipt = if data.roster.is_empty() {
+        "roster empty — heavy placements QUEUED".to_string()
+    } else {
+        format!("seed {} over [{}]; picks: {}", data.draw_seed, data.roster.join(", "), data.draw_picks.join(", "))
+    };
 
     // The plan is a record: fields scroll + rendering beside it,
     // and the same pair appended to the history run.
@@ -2102,6 +2183,7 @@ pub fn plan_cmd() -> i32 {
         ("plan version", plan::PLAN_VERSION),
         ("emitted", &stamp),
         ("disk gate", &data.disk_gate),
+        ("fair draw", &draw_receipt),
         ("gate reason", &data.gate_reason),
         ("open tasks", &data.open_tasks().to_string()),
         ("tasks source", if tasks_source.is_empty() { "(none configured)" } else { &tasks_source }),
@@ -2157,25 +2239,61 @@ pub fn serve(port: u16) -> i32 {
         }
     };
     println!("qexo serve — http://{}:{} — payloads are scroll text", bind_ip, port);
-    println!("routes: / (home index), /v1/doctor, /v1/plan, /v1/peers, /v1/scroll/<coord>, /v1/release, /v1/release/signature, /release/qexo-<version>");
+    println!("routes: / (home index), /v1/doctor, /v1/plan, /v1/peers, /v1/scroll/<coord>, /v1/release, /v1/release/signature, /release/qexo-<version>, POST /v1/dispatch");
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
             Err(_) => continue,
         };
+        // Read the request: headers to the blank line,
+        // then the body its Content-Length names (a
+        // dispatch bundle outgrows one read; the shipped
+        // GET routes carry no body at all).
+        let mut raw: Vec<u8> = Vec::new();
         let mut buf = [0u8; 8192];
-        let n = match stream.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let head_len = loop {
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => break raw.len(),
+                Ok(n) => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.len() > 1_048_576 {
+                        break raw.len();
+                    }
+                }
+                Err(_) => break raw.len(),
+            }
         };
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let path = req
+        let head_text = String::from_utf8_lossy(&raw[..head_len]).to_string();
+        let mut parts = head_text.split_whitespace();
+        let method = parts.next().unwrap_or("GET").to_string();
+        let path = parts.next().unwrap_or("/").to_string();
+        let content_length: usize = head_text
             .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .unwrap_or("/")
-            .to_string();
-        let (status, ctype, body) = route(&path);
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    v.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while raw.len() < head_len + content_length {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        let body_bytes: &[u8] = if head_len <= raw.len() { &raw[head_len..] } else { &[] };
+        let (status, ctype, body) = if method == "POST" && path == "/v1/dispatch" {
+            route_dispatch(body_bytes)
+        } else {
+            route(&path)
+        };
         let mut resp = format!(
             "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             status,
@@ -2204,6 +2322,34 @@ fn text_route(status: &str, body: String) -> (String, &'static str, Vec<u8>) {
     (status.to_string(), "text/plain; charset=utf-8", body.into_bytes())
 }
 
+/// POST /v1/dispatch (slice 4, §3.4): a bundle
+/// arrives, the acceptance rule judges it, and the
+/// outcome — acceptance or refusal, each carrying its
+/// receipt — is the response. State changes only
+/// through the acceptance path: an acceptance files
+/// the attempt and its assignment; a refusal files its
+/// receipt and nothing else; an unparsable bundle is a
+/// 400 before state is ever loaded.
+fn route_dispatch(body_bytes: &[u8]) -> (String, &'static str, Vec<u8>) {
+    if let Err(e) = crate::wire::parse_wire_bundle(body_bytes) {
+        return text_route("400 Bad Request", format!("qexo dispatch: {}\n", e));
+    }
+    let mut lat = match Lattice::load() {
+        Ok(Some(l)) => l,
+        Ok(None) => return text_route("200 OK", "qexo: state not born — run qexo config on the node\n".to_string()),
+        Err(e) => return text_route("500 Internal Server Error", format!("qexo: state unreadable: {}\n", e)),
+    };
+    let gpg = crate::crypto::Gpg::open_in(&lattice::state_dir());
+    let (status, body) = match crate::wire::accept_wire_bundle(&mut lat, &gpg, body_bytes) {
+        crate::wire::AcceptOutcome::Accepted(b) => ("200 OK", b),
+        crate::wire::AcceptOutcome::Refused(r) => ("403 Forbidden", format!("{}\n", r)),
+    };
+    if let Err(e) = lat.save() {
+        return text_route("500 Internal Server Error", format!("qexo: cannot save state: {}\n", e));
+    }
+    text_route(status, body)
+}
+
 fn route(path: &str) -> (String, &'static str, Vec<u8>) {
     let lat = match Lattice::load() {
         Ok(Some(l)) => l,
@@ -2218,6 +2364,7 @@ fn route(path: &str) -> (String, &'static str, Vec<u8>) {
         "/v1/doctor" => {
             let mut report = doctor::check(&lattice::state_dir(), &lattice::state_path());
             report.findings.extend(doctor::check_lattice(&lat).findings);
+            report.findings.extend(doctor::check_queue(&lat).findings);
             text_route("200 OK", report.render())
         }
         "/v1/plan" => text_route(
@@ -2232,12 +2379,15 @@ fn route(path: &str) -> (String, &'static str, Vec<u8>) {
             // One scroll by its full 9D coordinate — the read the
             // phextnet's convergence passes navigate by: a peer's
             // index scroll names the records, this route carries
-            // them. Read-only, like everything serve does; state
-            // changes only ever arrive as whole verified acts
-            // (register, sync adoption), never as writes here.
+            // them. The address may carry a `$N:` universe prefix
+            // (slice 4: an origin reads its executor's attempt
+            // scrolls here). Read-only, like every GET serve
+            // does; state changes only ever arrive as whole
+            // verified acts (register, sync adoption, a verified
+            // dispatch bundle), never as writes here.
             let coord_s = &path["/v1/scroll/".len()..];
-            match crate::phext::parse_coord(coord_s) {
-                Some(c) => match lat.px.get(&c) {
+            match crate::phext::parse_universe_addr(coord_s) {
+                Some((n, c)) => match lat.universe(n).and_then(|u| u.get(&c)) {
                     Some(t) => text_route("200 OK", t.clone()),
                     None => text_route("404 Not Found", format!("no scroll at {}\n", coord_s)),
                 },
@@ -2268,7 +2418,7 @@ fn route(path: &str) -> (String, &'static str, Vec<u8>) {
         }
         _ => text_route(
             "404 Not Found",
-            "no such route — qexo serves /, /v1/doctor, /v1/plan, /v1/peers, /v1/scroll/<coord>, /v1/release, /v1/release/signature, /release/qexo-<version> (payloads are scroll text; the release binary is the one byte route)\n".to_string(),
+            "no such route — qexo serves /, /v1/doctor, /v1/plan, /v1/peers, /v1/scroll/<coord>, /v1/release, /v1/release/signature, /release/qexo-<version>, POST /v1/dispatch (payloads are scroll text; the release binary is the one byte route)\n".to_string(),
         ),
     }
 }
@@ -2310,6 +2460,11 @@ struct Manifest {
     size_bytes: u64,
     signer: String,
     binary: String,
+    /// The platform the announced binary was built for
+    /// ("linux-x86_64", "windows-x86_64", "android-aarch64", ...),
+    /// stamped by `qexo release` since v1.6.2. None for a
+    /// pre-v1.6.2 announcement, which carries no stamp.
+    platform: Option<String>,
 }
 
 fn parse_manifest(text: &str) -> Result<Manifest, String> {
@@ -2320,14 +2475,39 @@ fn parse_manifest(text: &str) -> Result<Manifest, String> {
         .ok_or("manifest has no usable size_bytes field")?;
     let signer = lattice::field(text, "signer").filter(|s| !s.is_empty()).ok_or("manifest has no signer field")?;
     let binary = lattice::field(text, "binary").unwrap_or_else(|| format!("qexo-{}", version));
-    Ok(Manifest { version, sha256, size_bytes, signer, binary })
+    let platform = lattice::field(text, "platform").filter(|s| !s.is_empty());
+    Ok(Manifest { version, sha256, size_bytes, signer, binary, platform })
+}
+
+/// This binary's own platform, in the manifest's stamp shape:
+/// "<os>-<arch>" from the target the binary was built for
+/// (std::env::consts) — linux-x86_64, windows-x86_64,
+/// android-aarch64, macos-aarch64, ...
+fn local_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The platform judgment (v1.6.2), pure: may an offer stamped
+/// `offered` run on a node whose platform is `local`? A stamped
+/// offer runs only on its own platform. An UNSTAMPED offer (a
+/// pre-v1.6.2 announcement — every release the phextnet carried
+/// before tonight) proceeds: the stamp did not exist when the
+/// signer announced it, and refusing the fleet's standing
+/// announcements would strand every node whose signer has not
+/// re-announced yet. Unstamped offers are still judged by
+/// signature, version, and sha256 exactly as before.
+fn platform_matches(offered: Option<&str>, local: &str) -> bool {
+    match offered {
+        Some(p) => p == local,
+        None => true,
+    }
 }
 
 /// Compose the manifest record text for a release. This exact
 /// text — every byte, trailing newline included — is what the
 /// signer signs and what verifiers check the signature against:
 /// the scroll IS the canonical form.
-fn compose_manifest(version: &str, sha256: &str, size_bytes: u64, built_from: &str, signer: &str, stamp: &str, binary: &str, sig_coord: &str) -> String {
+fn compose_manifest(version: &str, sha256: &str, size_bytes: u64, built_from: &str, signer: &str, platform: &str, stamp: &str, binary: &str, sig_coord: &str) -> String {
     lattice::record(&[
         ("kind", "release announcement"),
         ("version", version),
@@ -2335,6 +2515,7 @@ fn compose_manifest(version: &str, sha256: &str, size_bytes: u64, built_from: &s
         ("size_bytes", &size_bytes.to_string()),
         ("built_from", built_from),
         ("signer", signer),
+        ("platform", platform),
         ("announced", stamp),
         ("binary", binary),
         ("signature", sig_coord),
@@ -2492,7 +2673,7 @@ pub fn release() -> i32 {
     let maddr = lattice::at(lattice::HL_LEDGERS, [lattice::LEDGER_RELEASES, 1, book, 1, 1, 1]);
     let saddr = lattice::at(lattice::HL_LEDGERS, [lattice::LEDGER_RELEASES, 1, book, 1, 1, 2]);
     let (_, stamp) = now_stamp();
-    let manifest = compose_manifest(version, &sha, size, built_from, &fp, &stamp, &binary_name, &fmt_coord(&saddr));
+    let manifest = compose_manifest(version, &sha, size, built_from, &fp, &local_platform(), &stamp, &binary_name, &fmt_coord(&saddr));
     let gpg = Gpg::open_in(&lattice::state_dir());
     let signature = match gpg.sign_detached(&fp, manifest.as_bytes()) {
         Ok(s) => s,
@@ -2521,6 +2702,7 @@ pub fn release() -> i32 {
     println!("release announced: qexo {}", version);
     println!("manifest: {} (signature beside it, {})", fmt_coord(&maddr), fmt_coord(&saddr));
     println!("signer: {}", fp);
+    println!("platform: {}", local_platform());
     println!("sha256: {}", sha);
     println!("binary: {} ({} bytes, served at /release/{})", dir.join(&binary_name).display(), size, binary_name);
     println!("receipt: {}", fmt_coord(&receipt));
@@ -2552,6 +2734,12 @@ enum UpdateOutcome {
     Available { from: String, to: String, via: String },
     NoOffer,
     IgnoredOffers,
+    /// The trusted signer's newest offer is stamped for a
+    /// different platform: judged, skipped before any download,
+    /// nothing applied. A routine state in a mixed fleet (the
+    /// signer announces one manifest; not every announcement is
+    /// for every node), so — like NoOffer — it writes no receipt.
+    WrongPlatform { offered: String, platform: String },
     Refused(String),
     NoSigner,
     SignerUnregistered,
@@ -2571,6 +2759,7 @@ pub fn update(check_only: bool) -> i32 {
             | UpdateOutcome::AlreadyCurrent { .. }
             | UpdateOutcome::Available { .. }
             | UpdateOutcome::NoOffer
+            | UpdateOutcome::WrongPlatform { .. }
             | UpdateOutcome::IgnoredOffers => 0,
             _ => 1,
         },
@@ -2619,6 +2808,7 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
     let gpg = Gpg::open_in(&lattice::state_dir());
     let mut saw_offer = false;
     let mut current_offer: Option<String> = None;
+    let mut platform_skip: Option<(String, String)> = None;
 
     for (_, _, text) in &peers {
         // Human output names the peer and shows its endpoint by
@@ -2726,6 +2916,35 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
             &manifest.version,
             &current,
         );
+        // The platform gate (v1.6.2) sits AFTER the trust rule
+        // and BEFORE any download: a trusted offer stamped for
+        // another platform is not an attack and not an update —
+        // it is the signer's announcement for some other part of
+        // a mixed fleet (Linux nodes, a Windows laptop, an
+        // Android phone poll the same signer). Skip it here,
+        // where skipping still costs nothing; before tonight,
+        // the version rule was the only guard (useless when a
+        // fleet-wide rollout offers every node the same version)
+        // and the swap's rollback was the last one — after the
+        // wrong platform's bytes had already been downloaded.
+        // A signature Refuse above is untouched: the gate never
+        // masks a trust failure.
+        if matches!(verdict, Assess::Accept | Assess::AlreadyCurrent)
+            && !platform_matches(manifest.platform.as_deref(), &local_platform())
+        {
+            let offered_platform = manifest.platform.clone().unwrap_or_default();
+            if loud {
+                println!(
+                    "peer {} offers qexo {} for platform {} — this node is {}; skipped, nothing downloaded",
+                    dname,
+                    manifest.version,
+                    offered_platform,
+                    local_platform()
+                );
+            }
+            platform_skip = Some((manifest.version.clone(), offered_platform));
+            continue;
+        }
         match verdict {
             Assess::NotOurSigner => unreachable!("signer equality checked above"),
             Assess::Refuse(why) => {
@@ -2748,6 +2967,12 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
                 current_offer = Some(manifest.version.clone());
             }
             Assess::Accept => {
+                if loud && manifest.platform.is_none() {
+                    println!(
+                        "note: the trusted signer's qexo {} manifest carries no platform stamp (a pre-v1.6.2 announcement) — judged by signature, version, and sha256, as before",
+                        manifest.version
+                    );
+                }
                 if mode != UpdateMode::Apply {
                     if mode == UpdateMode::Check {
                         println!(
@@ -2772,6 +2997,16 @@ fn update_inner(mode: UpdateMode) -> Result<UpdateOutcome, i32> {
             println!("already current — this node runs qexo {}; the trusted signer offers {}", current, offered);
         }
         Ok(UpdateOutcome::AlreadyCurrent { offered })
+    } else if let Some((offered, platform)) = platform_skip {
+        if loud {
+            println!(
+                "qexo update: the trusted signer offers qexo {} for platform {} — this node is {}; nothing applied",
+                offered,
+                platform,
+                local_platform()
+            );
+        }
+        Ok(UpdateOutcome::WrongPlatform { offered, platform })
     } else if saw_offer {
         if loud {
             println!("qexo update: offers were seen, none from this node's release signer — nothing applied");
@@ -3394,6 +3629,7 @@ fn set_binary_outcome(report: &mut EvolveReport, outcome: &UpdateOutcome) {
         UpdateOutcome::AlreadyCurrent { offered } => format!("already current (the signer offers {})", offered),
         UpdateOutcome::Available { from, to, via } => format!("update available: {} → {} via {} (not applied — check only)", from, to, via),
         UpdateOutcome::NoOffer => "no release offered by any trusted peer".to_string(),
+        UpdateOutcome::WrongPlatform { offered, platform } => format!("the signer offers {} for platform {} — not this node's; binary stage skipped it before any download", offered, platform),
         UpdateOutcome::IgnoredOffers => "offers seen, none from the trusted signer — nothing applied".to_string(),
         UpdateOutcome::Refused(why) => format!("REFUSED — {}", why),
         UpdateOutcome::NoSigner => "no release signer configured — binary stage had nothing to trust".to_string(),
@@ -3679,9 +3915,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let gpg = Gpg::open_in(&dir);
         let fp = gpg.generate("qexo test signer", "qexo test").expect("test key generation");
-        let text = compose_manifest("1.1.0", &hash::sha256_hex(b"fake-binary"), 11, "deadbeef", &fp, "2026-11-12 00:00 UTC", "qexo-1.1.0", "6.6.6/8.1.1/1.1.2");
+        let text = compose_manifest("1.1.0", &hash::sha256_hex(b"fake-binary"), 11, "deadbeef", &fp, "linux-x86_64", "2026-11-12 00:00 UTC", "qexo-1.1.0", "6.6.6/8.1.1/1.1.2");
         let m = parse_manifest(&text).expect("manifest parses");
         assert_eq!(m.version, "1.1.0");
+        assert_eq!(m.platform.as_deref(), Some("linux-x86_64"));
         assert_eq!(m.signer, fp);
         assert_eq!(m.size_bytes, 11);
         assert_eq!(m.binary, "qexo-1.1.0");
@@ -3697,6 +3934,42 @@ mod tests {
         let gpg2_dir = dir.join("other");
         let gpg2 = Gpg::open_in(&gpg2_dir);
         assert!(gpg2.verify_detached(&sig, text.as_bytes()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn platform_stamp_gates_foreign_platforms_and_spares_legacy() {
+        // a stamped offer runs only on its own platform
+        assert!(platform_matches(Some("linux-x86_64"), "linux-x86_64"));
+        assert!(!platform_matches(Some("linux-x86_64"), "android-aarch64"));
+        assert!(!platform_matches(Some("windows-x86_64"), "linux-x86_64"));
+        assert!(!platform_matches(Some("android-aarch64"), "windows-x86_64"));
+        // an unstamped offer (every pre-v1.6.2 announcement)
+        // proceeds on any platform — judged by the older rules
+        assert!(platform_matches(None, "linux-x86_64"));
+        assert!(platform_matches(None, "android-aarch64"));
+        // the local stamp has the manifest's shape: <os>-<arch>
+        let lp = local_platform();
+        let (os, arch) = lp.split_once('-').expect("platform stamp carries a dash");
+        assert_eq!(os, std::env::consts::OS);
+        assert_eq!(arch, std::env::consts::ARCH);
+        assert!(platform_matches(Some(&lp), &lp));
+    }
+
+    #[test]
+    fn manifest_without_platform_line_parses_as_legacy() {
+        // a pre-v1.6.2 announcement: the same record with the
+        // platform line absent — it must still parse, as None,
+        // never as an error and never as an invented platform.
+        let dir = std::env::temp_dir().join(format!("qexo-legacy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gpg = Gpg::open_in(&dir);
+        let fp = gpg.generate("qexo legacy signer", "qexo test").expect("test key generation");
+        let stamped = compose_manifest("1.3.0", &hash::sha256_hex(b"old-binary"), 10, "cafe", &fp, "linux-x86_64", "2026-11-13 00:00 UTC", "qexo-1.3.0", "6.6.6/8.1.1/1.1.2");
+        let legacy: String = stamped.lines().filter(|l| !l.starts_with("platform:")).collect::<Vec<_>>().join("\n") + "\n";
+        let m = parse_manifest(&legacy).expect("legacy manifest parses");
+        assert_eq!(m.version, "1.3.0");
+        assert_eq!(m.platform, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
