@@ -1,3 +1,26 @@
+
+## v1.8.0 — the twin ships the dispatch core (2026-11-17)
+
+wbic16/qexo is the twin: the same qexo, carried in
+the repo the Android builds ride. Slice 8 moves
+this tree to v1.8.0 alongside wbic16/quarterexo —
+the bump is three one-line stamp changes here
+(Cargo.toml, Cargo.lock, VERSION), the content is
+the dispatch core the twin sync landed, and the
+post-bump tree diff against quarterexo is still
+exactly the sanctioned remainder: src/core.rs
+and these two per-repo documents.
+
+From this tree: the Android aarch64 binary and
+the launcher v3 APK (versionCode 5 / versionName
+1.8.0), staged on aletheia-core with the rest of
+the release. The APK is a build, not a
+publication — nothing was published from this
+tree, and the fleet rollout is Will-timed in
+quarterexo, whose ship notes carry the release
+record.
+
+---
 # qexo v1.6.1 — ship notes (the Android app becomes a control surface; home: wbic16/qexo)
 
 Status: v1.6.1 BUILT AND GATED, 2026-11-14 — one change on
