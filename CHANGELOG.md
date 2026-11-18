@@ -1,3 +1,35 @@
+## 1.8.0 (v1.8.0) — the ship: the dispatch core releases, 2026-11-17
+
+**This tree ships with wbic16/quarterexo at v1.8.0.**
+Slice 8 of the dispatch core (SPEC §13.3) is a
+version bump on both repos, and this tree moves
+with quarterexo off the 1.7.3 parity stamp the
+twin sync left: Cargo.toml, Cargo.lock, and
+VERSION now read 1.8.0 here too, and the tree
+diff against quarterexo remains exactly the
+sanctioned remainder — src/core.rs (this tree's
+Android timer truth) and the two per-repo
+documents in their own voices.
+
+What ships from this tree is the phone surface:
+the Android aarch64 build of the whole dispatch
+core — chain state and the queue oracle, the
+register drain, wire dispatch with the fair
+draw, F5 resume/teleport, the F6 bridge
+registry, and the --app drivers — and the
+launcher v3 APK built on it (versionCode 5,
+versionName 1.8.0), the first APK to carry the
+v3 quick actions (Enqueue, tappable Queue,
+Show / Dispatch now / Pause / Resume, Audit
+over one persistent session). Gates run on this
+tree match quarterexo's: cargo 159/159, full
+windows-gnu and Android links, and --app
+transcripts byte-identical to the quarterexo
+build's. The publish and the fleet rollout are
+Will-timed, as in quarterexo; the engineering
+record lives there. See quarterexo's CHANGELOG
+v1.8.0.
+
 # qexo changelog — the scratch line
 
 ## 1.7.3 (v1.7.3) — twin sync: the dispatch core, whole, 2026-11-17
